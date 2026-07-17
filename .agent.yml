@@ -4,7 +4,7 @@ lint_commands: []
 ignore_patterns:
   - .venv/**
   - build/**
-approval_policy: ask_on_write
+approval_policy: allow_write
 max_steps: 40
 context_keep_tool_batches: 3
 artifact_threshold_tokens: 1000
@@ -18,3 +18,10 @@ context_summary_retry_count: 1
 context_message_trim_trigger: 60
 context_message_keep_head: 3
 context_message_keep_tail: 47
+team_auto_receive: true
+team_message_batch_size: 20
+team_message_token_limit: 4000
+team_delivery_timeout_seconds: 60
+team_session_recent_messages: 12
+team_session_summary_tokens: 2000
+team_require_write_scope: false

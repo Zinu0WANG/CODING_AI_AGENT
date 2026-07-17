@@ -73,13 +73,15 @@ class TeammateManager:
                 return f"Error: {name} is currently {member['status']}"
             if member:
                 member.update({"role": role, "status": "working", "current_task": task_id,
-                               "write_scope": write_scope or [], "last_heartbeat": time.time()})
+                               "write_scope": write_scope if write_scope is not None else ["<workspace>"],
+                               "last_heartbeat": time.time()})
             else:
                 self.config["members"].append({"name": name, "role": role, "status": "working",
-                                               "current_task": task_id, "write_scope": write_scope or [],
+                                               "current_task": task_id,
+                                               "write_scope": write_scope if write_scope is not None else ["<workspace>"],
                                                "last_heartbeat": time.time()})
             self._save()
-            thread = threading.Thread(target=self._loop, args=(name, role, prompt, task_id, write_scope or []), daemon=True, name=f"agent-{name}")
+            thread = threading.Thread(target=self._loop, args=(name, role, prompt, task_id, write_scope), daemon=True, name=f"agent-{name}")
             self._threads[name] = thread
             thread.start()
         return f"Spawned {name} ({role})"
@@ -113,21 +115,22 @@ class TeammateManager:
         temporary.replace(path)
 
     def _work(self, name: str, role: str, prompt: str, task_id: int | None = None,
-              write_scope: list[str] | None = None) -> object:
+              write_scope: list[str] | None = None, report: bool = True) -> object:
         session = self._load_session(name)
         continuity = ""
         if session.get("summary") or session.get("recent_messages"):
             continuity = f"\nPREVIOUS SESSION SUMMARY:\n{session.get('summary', '')}\nRECENT EXCHANGES:\n{json.dumps(session.get('recent_messages', []), ensure_ascii=False)}"
-        result = self.run_agent(f"You are teammate {name}, role: {role}. {prompt}{continuity}", name, write_scope or [])
+        result = self.run_agent(f"You are teammate {name}, role: {role}. {prompt}{continuity}", name, write_scope)
         status = getattr(result, "status", "failed")
         answer = getattr(result, "answer", "")
         self._save_session(name, role, prompt, result, task_id)
-        message_type = "task_completed" if status == "completed" else "task_failed"
-        self.bus.send(name, "lead", {"status": status, "answer": answer, "run_id": getattr(result, "run_id", None)},
-                      message_type, task_id=task_id)
+        if report:
+            message_type = "task_completed" if status == "completed" else "task_failed"
+            self.bus.send(name, "lead", {"status": status, "answer": answer, "run_id": getattr(result, "run_id", None)},
+                          message_type, task_id=task_id)
         return result
 
-    def _loop(self, name: str, role: str, prompt: str, task_id: int | None, write_scope: list[str]) -> None:
+    def _loop(self, name: str, role: str, prompt: str, task_id: int | None, write_scope: list[str] | None) -> None:
         try:
             self._work(name, role, prompt, task_id, write_scope)
             self._status(name, "idle")
@@ -159,9 +162,15 @@ class TeammateManager:
                             member["write_scope"] = task.get("write_scope", [])
                             self._save()
                     self._status(name, "working")
-                    self._work(name, role, f"Task #{task['id']}: {task['subject']}\n{task.get('description', '')}",
-                               task["id"], task.get("write_scope", []))
-                    self.tasks.update(task["id"], "completed")
+                    result = self._work(name, role, f"Task #{task['id']}: {task['subject']}\n{task.get('description', '')}",
+                                        task["id"], task.get("write_scope", []), report=False)
+                    result_status = getattr(result, "status", "failed")
+                    message_type = "task_completed" if result_status == "completed" else "task_failed"
+                    self.bus.send(name, "lead", {
+                        "status": result_status, "answer": getattr(result, "answer", ""),
+                        "run_id": getattr(result, "run_id", None),
+                    }, message_type, task_id=task["id"], conversation_id=task.get("conversation_id"))
+                    self.tasks.update(task["id"], "completed" if result_status == "completed" else "pending")
                     with self._lock:
                         member = self._member(name)
                         if member:

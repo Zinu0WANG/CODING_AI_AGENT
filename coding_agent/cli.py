@@ -15,6 +15,7 @@ from .config import AgentConfig
 from .events import EventStore
 from .policy import PolicyDecision, RiskLevel
 from .runtime import AgentRuntime, AnthropicModel, RunResult
+from .state import MessageBus, TaskManager
 
 
 class AgentCLI:
@@ -94,6 +95,46 @@ class AgentCLI:
             table.add_row(f"+{event.get('timestamp', 0) - started:.2f}s", event.get("actor", ""), event.get("type", ""), payload[:160])
         self.console.print(table)
 
+    def show_team(self) -> None:
+        if self.last_runtime and self.last_runtime.team:
+            team_summary = self.last_runtime.team.list_all()
+        else:
+            config_path = self.workspace / ".team" / "config.json"
+            team_config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {"team_name": "default", "members": []}
+            bus = MessageBus(self.workspace / ".team" / "team.db", self.config.team_delivery_timeout_seconds)
+            lines = [f"Team: {team_config.get('team_name', 'default')}"]
+            for member in team_config.get("members", []):
+                pending = len(bus.list_messages(member.get("name"), status="pending", limit=100))
+                lines.append(f"- {member.get('name')} ({member.get('role')}): {member.get('status')} "
+                             f"task={member.get('current_task')} scope={member.get('write_scope', [])} "
+                             f"heartbeat={member.get('last_heartbeat')} pending={pending}")
+            team_summary = "\n".join(lines)
+        self.console.print(Panel(team_summary, title="Team"))
+        self.console.print(Panel(TaskManager(self.workspace / ".tasks").list_all(), title="Tasks and write scopes"))
+
+    def show_messages(self, status: str | None = None) -> None:
+        bus = MessageBus(self.workspace / ".team" / "team.db", self.config.team_delivery_timeout_seconds)
+        try:
+            messages = bus.list_messages(status=status or None, limit=100)
+        except ValueError as exc:
+            self.console.print(f"[red]{exc}[/red]")
+            return
+        table = Table("ID", "Status", "Type", "From", "To", "Task", "Attempts", "Content", title="Team messages")
+        for message in messages:
+            content = json.dumps(message["content"], ensure_ascii=False, default=str)
+            table.add_row(message["message_id"][:8], message["status"], message["type"], message["sender"],
+                          message["recipient"], str(message.get("task_id") or ""),
+                          str(message["delivery_attempts"]), content[:100])
+        self.console.print(table)
+
+    def retry_message(self, message_id: str) -> None:
+        if not message_id:
+            self.console.print("[red]Usage: /retry-message MESSAGE_ID[/red]")
+            return
+        bus = MessageBus(self.workspace / ".team" / "team.db", self.config.team_delivery_timeout_seconds)
+        self.console.print("[green]Message queued for redelivery.[/green]" if bus.retry(message_id)
+                           else "[red]Message not found or already acknowledged.[/red]")
+
     def handle_command(self, command: str) -> bool:
         parts = command.strip().split(maxsplit=1)
         name = parts[0].lower()
@@ -102,6 +143,12 @@ class AgentCLI:
             return False
         if name == "/runs":
             self.show_runs()
+        elif name == "/team":
+            self.show_team()
+        elif name == "/messages":
+            self.show_messages(argument or None)
+        elif name == "/retry-message":
+            self.retry_message(argument)
         elif name in {"/inspect", "/replay"}:
             self.inspect(argument, replay=name == "/replay")
         elif name == "/diff":
@@ -116,7 +163,8 @@ class AgentCLI:
                 self.last_runtime.abort()
             self.console.print("[yellow]Current run marked aborted.[/yellow]")
         elif name == "/help":
-            self.console.print("/runs · /inspect ID · /replay ID · /diff · /test · /abort · /exit")
+            self.console.print("/runs · /inspect ID · /replay ID · /team · /messages [STATUS] · "
+                               "/retry-message ID · /diff · /test · /abort · /exit")
         else:
             self.console.print(f"[red]Unknown command: {name}[/red]")
         return True

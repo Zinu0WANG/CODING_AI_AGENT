@@ -134,6 +134,7 @@ def test_message_bus_redelivers_unacknowledged_messages(tmp_path: Path):
     second = bus.receive("lead")[0]
     assert second["message_id"] == first["message_id"]
     assert second["delivery_attempts"] == 2
+    assert bus.retry(second["message_id"][:8]) is True
 
 
 def test_message_bus_imports_legacy_jsonl_once(tmp_path: Path):

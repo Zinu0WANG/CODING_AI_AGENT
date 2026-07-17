@@ -70,6 +70,13 @@ context_summary_retry_count: 1
 context_message_trim_trigger: 60
 context_message_keep_head: 3
 context_message_keep_tail: 47
+team_auto_receive: true
+team_message_batch_size: 20
+team_message_token_limit: 4000
+team_delivery_timeout_seconds: 60
+team_session_recent_messages: 12
+team_session_summary_tokens: 2000
+team_require_write_scope: true
 ```
 
 配置文件中的 lint/test 命令被视为仓库所有者提供的可信命令。模型临时生成的 Shell 命令仍经过策略判断。
@@ -159,4 +166,8 @@ python -m compileall -q agent.py coding_agent
 - `.runs/`：轨迹、RepoMap 缓存。
 - `.tasks/`：持久化任务。
 - `.team/`：团队配置与信箱。
+- `.team/team.db`：可靠消息队列；消息经过 `pending → delivered → acknowledged`，不再读取即删除。
+- `.team/sessions/`：持久队友的精简会话检查点。
+- `/team` 查看队友、任务与写入范围；`/messages` 查看消息；`/retry-message ID` 重新投递未确认消息。
+- 主 Agent 每轮模型调用前自动接收队友更新，模型调用成功后才 ACK；写入型子 Agent 受 `write_scope` 限制。
 - `.transcripts/`：旧版本兼容数据，可手动清理。

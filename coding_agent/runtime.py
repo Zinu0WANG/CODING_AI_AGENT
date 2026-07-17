@@ -139,7 +139,7 @@ class AgentRuntime:
         delegated_names = {"task", "spawn_teammate", "list_teammates", "send_message", "read_inbox", "ack_message", "broadcast", "shutdown_request"}
         if name in delegated_names:
             self.events.emit("tool_requested", "lead", {"tool": name, "arguments": arguments})
-            risk = RiskLevel.READ if name in {"list_teammates", "read_inbox"} or (name == "task" and arguments.get("agent_type", "Explore") == "Explore") else RiskLevel.WRITE
+            risk = RiskLevel.READ if name in {"list_teammates", "read_inbox", "ack_message"} or (name == "task" and arguments.get("agent_type", "Explore") == "Explore") else RiskLevel.WRITE
             decision = PolicyDecision(risk, "delegates work or changes team state" if risk is RiskLevel.WRITE else "read-only coordination")
             if not self.tools.authorize(name, arguments, decision):
                 output = f"Error: {risk.value} operation denied: {decision.reason}"
@@ -157,7 +157,7 @@ class AgentRuntime:
                                       interactive=False, enable_team=False, actor="subagent", allowed_write_scope=[])
                 result = nested.run(prompt)
             else:
-                write_scope = arguments.get("write_scope", [])
+                write_scope = arguments.get("write_scope")
                 if self.config.team_require_write_scope and not write_scope:
                     return "Error: general-purpose subagents require write_scope"
                 result = self._run_delegated(prompt, "subagent", write_scope)
@@ -166,7 +166,9 @@ class AgentRuntime:
             return output
         if self.team:
             if name == "spawn_teammate":
-                write_scope = arguments.get("write_scope", [])
+                write_scope = arguments.get("write_scope")
+                if self.config.team_require_write_scope and write_scope is None:
+                    write_scope = []
                 output = self.team.spawn(arguments["name"], arguments["role"], arguments["prompt"],
                                          arguments.get("task_id"), write_scope)
                 self.events.emit("tool_finished", "lead", {"tool": name, "ok": not output.startswith("Error:"), "output": output})

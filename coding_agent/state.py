@@ -82,7 +82,9 @@ class MessageBus:
         task_id = task_id if task_id is not None else extra.get("task_id")
         conversation_id = conversation_id or extra.get("conversation_id") or str(uuid.uuid4())
         message_id = str(uuid.uuid4())
-        serialized = json.dumps(content, ensure_ascii=False, default=str)[:50_000]
+        serialized = json.dumps(content, ensure_ascii=False, default=str)
+        if len(serialized) > 50_000:
+            serialized = json.dumps({"truncated": True, "preview": serialized[:48_000]}, ensure_ascii=False)
         with self._connect() as connection:
             connection.execute(
                 "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, 0)",
@@ -133,18 +135,27 @@ class MessageBus:
             return 0
         placeholders = ",".join("?" for _ in message_ids)
         with self._connect() as connection:
+            acknowledged = connection.execute(
+                f"SELECT message_id FROM messages WHERE recipient=? AND status='delivered' AND message_id IN ({placeholders})",
+                (recipient, *message_ids),
+            ).fetchall()
             cursor = connection.execute(
                 f"UPDATE messages SET status='acknowledged', acknowledged_at=? WHERE recipient=? AND status='delivered' AND message_id IN ({placeholders})",
                 (time.time(), recipient, *message_ids),
             )
-        for message_id in message_ids:
-            self._emit("message_acknowledged", recipient, {"message_id": message_id})
+        for row in acknowledged:
+            self._emit("message_acknowledged", recipient, {"message_id": row["message_id"]})
         return cursor.rowcount
 
     def retry(self, message_id: str) -> bool:
         with self._connect() as connection:
+            matches = connection.execute(
+                "SELECT message_id FROM messages WHERE message_id LIKE ? AND status!='acknowledged'", (message_id + "%",),
+            ).fetchall()
+            if len(matches) != 1:
+                return False
             cursor = connection.execute(
-                "UPDATE messages SET status='pending', delivered_at=NULL WHERE message_id=? AND status!='acknowledged'", (message_id,),
+                "UPDATE messages SET status='pending', delivered_at=NULL WHERE message_id=?", (matches[0]["message_id"],),
             )
         return cursor.rowcount == 1
 
@@ -280,6 +291,8 @@ class TaskManager:
                 return f"Task {task_id} deleted"
             if status:
                 task["status"] = status
+                if status == "pending":
+                    task["owner"] = None
             if add_blocked_by:
                 for blocker in add_blocked_by:
                     self._load(blocker)
