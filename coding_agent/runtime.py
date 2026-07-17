@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 from .config import AgentConfig
 from .context import RepoMap
-from .context_management import ArtifactStore, ContextManager, ConversationCompactor
+from .context_management import ArtifactStore, ContextManager, ConversationCompactor, MessageCountTrimmer
 from .events import EventStore
 from .policy import PolicyDecision, RiskLevel
 from .tools import ApprovalCallback, ToolRegistry
@@ -89,6 +89,12 @@ class AgentRuntime:
             summary_max_tokens=config.context_summary_max_tokens,
             summary_retry_count=config.context_summary_retry_count,
             output_reserve_tokens=8000,
+        )
+        self.message_trimmer = MessageCountTrimmer(
+            self.context, self.events,
+            trigger=config.context_message_trim_trigger,
+            keep_head=config.context_message_keep_head,
+            keep_tail=config.context_message_keep_tail,
         )
         self.tools = ToolRegistry(self.workspace, config, self.events, approval_callback,
                                   artifact_store=self.artifacts)
@@ -211,6 +217,7 @@ class AgentRuntime:
         try:
             for step in range(self.config.max_steps):
                 self.context.compact()
+                messages = self.message_trimmer.trim_if_needed(messages)
                 schemas = self.tool_schemas
                 messages = self.compactor.compact_if_needed(
                     system, messages, schemas, self._summarize_context,

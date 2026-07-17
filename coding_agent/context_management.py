@@ -242,16 +242,37 @@ class ContextManager:
                 count += int(self._externalize(reference))
         return count
 
-    def archive_messages(self, messages: list[dict], start: int, end: int) -> ArtifactMetadata:
+    def forget_results(self, messages: list[dict]) -> int:
+        """Release batch references after their containing messages were archived."""
+        archived_ids = {
+            id(block)
+            for message in messages
+            for block in (message.get("content", []) if isinstance(message.get("content"), list) else [])
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+        }
+        removed = 0
+        retained_batches: list[list[ToolResultReference]] = []
+        for batch in self.batches:
+            retained = [reference for reference in batch if id(reference.result) not in archived_ids]
+            removed += len(batch) - len(retained)
+            if retained:
+                retained_batches.append(retained)
+        self.batches = retained_batches
+        return removed
+
+    def archive_messages(self, messages: list[dict], start: int, end: int,
+                         details: dict | None = None) -> ArtifactMetadata:
         selected = messages[start:end]
         content = json.dumps(
             {"format": "agent_context_archive_v1", "messages": selected},
             ensure_ascii=False, default=str, indent=2,
         )
         roles = [str(message.get("role", "unknown")) for message in selected]
+        archive_details = {"message_start": start, "message_end": end, "roles": roles}
+        archive_details.update(details or {})
         metadata = self.store.create(
             "context_compactor", content, "success", kind="context_archive",
-            details={"message_start": start, "message_end": end, "roles": roles},
+            details=archive_details,
         )
         self.events.emit("context_archive_created", "runtime", {
             "artifact_id": metadata.artifact_id, "message_start": start,
@@ -259,6 +280,130 @@ class ContextManager:
             "estimated_tokens": metadata.estimated_tokens,
         })
         return metadata
+
+
+def _tool_ids(message: dict, block_type: str, id_key: str) -> list[str]:
+    content = message.get("content", [])
+    if not isinstance(content, list):
+        return []
+    return [
+        block.get(id_key, "") for block in content
+        if isinstance(block, dict) and block.get("type") == block_type
+    ]
+
+
+def _validated_message_units(messages: list[dict]) -> tuple[list[tuple[int, int]], str | None]:
+    """Group valid tool exchanges and reject any orphaned protocol blocks."""
+    units: list[tuple[int, int]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        use_ids = _tool_ids(message, "tool_use", "id")
+        result_ids = _tool_ids(message, "tool_result", "tool_use_id")
+        if result_ids:
+            return [], "orphaned tool_result"
+        if use_ids:
+            if message.get("role") != "assistant" or not all(use_ids) or len(set(use_ids)) != len(use_ids):
+                return [], "invalid tool_use"
+            if index + 1 >= len(messages):
+                return [], "tool_use missing tool_result message"
+            result_message = messages[index + 1]
+            paired_ids = _tool_ids(result_message, "tool_result", "tool_use_id")
+            if result_message.get("role") != "user" or sorted(paired_ids) != sorted(use_ids):
+                return [], "tool_use and tool_result IDs do not match"
+            units.append((index, index + 2))
+            index += 2
+            continue
+        units.append((index, index + 1))
+        index += 1
+    return units, None
+
+
+class MessageCountTrimmer:
+    def __init__(self, context: ContextManager, events: EventStore, *, trigger: int = 60,
+                 keep_head: int = 3, keep_tail: int = 47):
+        self.context = context
+        self.events = events
+        self.trigger = trigger
+        self.keep_head = keep_head
+        self.keep_tail = keep_tail
+
+    @staticmethod
+    def _append_reference(head: list[dict], reference: str) -> tuple[list[dict], bool]:
+        copied = [dict(message) for message in head]
+        for index in range(len(copied) - 1, -1, -1):
+            if copied[index].get("role") != "user":
+                continue
+            content = copied[index].get("content", "")
+            if isinstance(content, str):
+                copied[index]["content"] = f"{content}\n\n{reference}"
+            elif isinstance(content, list):
+                copied[index]["content"] = [*content, {"type": "text", "text": reference}]
+            else:
+                copied[index]["content"] = f"{_json_text(content)}\n\n{reference}"
+            return copied, False
+        copied.append({"role": "user", "content": reference})
+        return copied, True
+
+    def trim_if_needed(self, messages: list[dict]) -> list[dict]:
+        before = len(messages)
+        if before <= self.trigger:
+            return messages
+        started = time.monotonic()
+        self.events.emit("context_message_trim_started", "runtime", {
+            "messages_before": before, "trigger": self.trigger,
+        })
+        units, protocol_error = _validated_message_units(messages)
+        if protocol_error:
+            self.events.emit("context_message_trim_skipped", "runtime", {
+                "reason": "invalid_tool_protocol", "detail": protocol_error,
+                "messages_before": before,
+            })
+            return messages
+
+        head_end = 0
+        for start, end in units:
+            head_end = end
+            if head_end >= self.keep_head:
+                break
+        tail_start = before
+        for start, end in reversed(units):
+            tail_start = start
+            if before - tail_start >= self.keep_tail:
+                break
+        if head_end >= tail_start:
+            self.events.emit("context_message_trim_skipped", "runtime", {
+                "reason": "retained_ranges_overlap", "messages_before": before,
+                "head_end": head_end, "tail_start": tail_start,
+            })
+            return messages
+
+        archived_count = tail_start - head_end
+        artifact = self.context.archive_messages(
+            messages, head_end, tail_start,
+            details={"reason": "message_count_trim"},
+        )
+        forgotten_results = self.context.forget_results(messages[head_end:tail_start])
+        reference = (
+            f"[trimmed context archive: {artifact.artifact_id}]\n"
+            f"Archived {archived_count} middle messages because message count exceeded {self.trigger}.\n"
+            "Use artifact_search or artifact_read for exact details."
+        )
+        head, inserted_reference_message = self._append_reference(messages[:head_end], reference)
+        trimmed = [*head, *messages[tail_start:]]
+        actual_head = head_end + int(inserted_reference_message)
+        boundary_expanded = head_end > self.keep_head or before - tail_start > self.keep_tail
+        self.events.emit("context_message_trim_completed", "runtime", {
+            "artifact_id": artifact.artifact_id, "messages_before": before,
+            "messages_after": len(trimmed), "archived_messages": archived_count,
+            "archived_estimated_tokens": artifact.estimated_tokens,
+            "retained_head_messages": actual_head,
+            "retained_tail_messages": before - tail_start,
+            "boundary_expanded": boundary_expanded,
+            "forgotten_tool_results": forgotten_results,
+            "duration_seconds": time.monotonic() - started,
+        })
+        return trimmed
 
 
 SUMMARY_INSTRUCTIONS = """Summarize the archived coding-agent conversation as trusted context data.

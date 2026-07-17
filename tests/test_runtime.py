@@ -174,3 +174,30 @@ def test_runtime_compacts_large_prompt_with_toolless_summary_call(tmp_path: Path
     event_types = [event["type"] for event in runtime.events.read_events()]
     assert "context_compaction_started" in event_types
     assert "context_compaction_completed" in event_types
+
+
+class ManyToolRoundsModel:
+    def __init__(self):
+        self.call = 0
+        self.saw_trim_reference = False
+
+    def create(self, **kwargs):
+        self.call += 1
+        if self.call == 31:
+            self.saw_trim_reference = "trimmed context archive" in json.dumps(kwargs["messages"])
+        if self.call <= 31:
+            return {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": f"round-{self.call}",
+                    "name": "read_file", "input": {"path": "missing.txt", "reason": "message trim test"}}]}
+        return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Finished many rounds"}]}
+
+
+def test_runtime_trims_message_count_before_calling_model_again(tmp_path: Path):
+    model = ManyToolRoundsModel()
+    runtime = AgentRuntime(tmp_path, AgentConfig(approval_policy="allow_write"), model, interactive=False)
+    result = runtime.run("Run many read rounds")
+
+    assert result.status == "completed"
+    assert model.saw_trim_reference
+    assert any(item.details.get("reason") == "message_count_trim" for item in runtime.artifacts.list_metadata())
+    event_types = [event["type"] for event in runtime.events.read_events()]
+    assert "context_message_trim_completed" in event_types

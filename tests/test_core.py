@@ -27,6 +27,9 @@ def test_config_loads_defaults_and_project_overrides(tmp_path: Path):
     assert config.context_compaction_target_tokens == 25000
     assert config.context_summary_max_tokens == 12000
     assert config.context_summary_retry_count == 1
+    assert config.context_message_trim_trigger == 60
+    assert config.context_message_keep_head == 3
+    assert config.context_message_keep_tail == 47
     assert config.artifact_read_default_chars == 8000
     assert config.artifact_search_max_hits == 5
 

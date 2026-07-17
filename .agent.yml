@@ -15,3 +15,6 @@ context_compaction_trigger_ratio: 0.70
 context_compaction_target_tokens: 25000
 context_summary_max_tokens: 12000
 context_summary_retry_count: 1
+context_message_trim_trigger: 60
+context_message_keep_head: 3
+context_message_keep_tail: 47

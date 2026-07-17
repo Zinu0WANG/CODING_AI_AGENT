@@ -67,6 +67,9 @@ context_compaction_trigger_ratio: 0.70
 context_compaction_target_tokens: 25000
 context_summary_max_tokens: 12000
 context_summary_retry_count: 1
+context_message_trim_trigger: 60
+context_message_keep_head: 3
+context_message_keep_tail: 47
 ```
 
 配置文件中的 lint/test 命令被视为仓库所有者提供的可信命令。模型临时生成的 Shell 命令仍经过策略判断。

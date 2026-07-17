@@ -7,6 +7,7 @@ from coding_agent.context_management import (
     ArtifactStore,
     ContextManager,
     ConversationCompactor,
+    MessageCountTrimmer,
     estimate_request_tokens,
     estimate_tokens,
 )
@@ -232,3 +233,106 @@ def test_compactor_bounds_summary_request_but_keeps_complete_archive(tmp_path: P
     assert "middle omitted" in received
     archive = next(item for item in manager.store.list_metadata() if item.kind == "context_archive")
     assert original in manager.store.artifact_path(archive.artifact_id).read_text(encoding="utf-8")
+
+
+def _tool_pair(tool_id: str) -> list[dict]:
+    return [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": tool_id,
+          "name": "read_file", "input": {"path": f"{tool_id}.txt"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id,
+          "content": f"result-{tool_id}"}]},
+    ]
+
+
+def test_message_trimmer_ignores_sixty_and_trims_sixty_one(tmp_path: Path):
+    events = EventStore(tmp_path, "message-limit")
+    manager = ContextManager(ArtifactStore(events.run_dir, events), events)
+    trimmer = MessageCountTrimmer(manager, events, trigger=60, keep_head=3, keep_tail=47)
+    sixty = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m-{i}"} for i in range(60)]
+    assert trimmer.trim_if_needed(sixty) is sixty
+
+    sixty_one = sixty + [{"role": "user", "content": "m-60"}]
+    trimmed = trimmer.trim_if_needed(sixty_one)
+    assert trimmed is not sixty_one
+    assert len(trimmed) == 50
+    assert trimmed[0]["content"] == "m-0"
+    assert trimmed[-1]["content"] == "m-60"
+    assert any(item.kind == "context_archive" for item in manager.store.list_metadata())
+
+
+def test_message_trimmer_keeps_head_three_tail_forty_seven_and_archives_middle(tmp_path: Path):
+    events = EventStore(tmp_path, "message-160")
+    manager = ContextManager(ArtifactStore(events.run_dir, events), events)
+    trimmer = MessageCountTrimmer(manager, events, trigger=60, keep_head=3, keep_tail=47)
+    messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"MESSAGE-{i}"} for i in range(160)]
+
+    trimmed = trimmer.trim_if_needed(messages)
+
+    assert len(trimmed) == 50
+    assert [message["content"].splitlines()[0] for message in trimmed[:3]] == ["MESSAGE-0", "MESSAGE-1", "MESSAGE-2"]
+    assert [message["content"] for message in trimmed[-47:]] == [f"MESSAGE-{i}" for i in range(113, 160)]
+    assert "trimmed context archive:" in trimmed[2]["content"]
+    archive = next(item for item in manager.store.list_metadata() if item.details.get("reason") == "message_count_trim")
+    archived = json.loads(manager.store.artifact_path(archive.artifact_id).read_text(encoding="utf-8"))
+    archived_contents = [message["content"] for message in archived["messages"]]
+    assert archived_contents[0] == "MESSAGE-3" and archived_contents[-1] == "MESSAGE-112"
+    assert "MESSAGE-2" not in archived_contents and "MESSAGE-113" not in archived_contents
+    assert manager.store.search("MESSAGE-50")[0]["artifact_id"] == archive.artifact_id
+
+
+def test_message_trimmer_expands_head_and_tail_to_keep_tool_pairs(tmp_path: Path):
+    events = EventStore(tmp_path, "pair-boundaries")
+    manager = ContextManager(ArtifactStore(events.run_dir, events), events)
+    trimmer = MessageCountTrimmer(manager, events, trigger=60, keep_head=3, keep_tail=47)
+    messages = [{"role": "user", "content": "initial"}, *_tool_pair("head")]
+    # Put another result exactly at the nominal tail boundary: assistant at 15, result at 16.
+    messages.extend({"role": "assistant" if i % 2 else "user", "content": f"filler-{i}"} for i in range(12))
+    messages.extend(_tool_pair("tail"))
+    messages.extend({"role": "assistant" if i % 2 else "user", "content": f"recent-{i}"} for i in range(46))
+    assert len(messages) == 63
+
+    trimmed = trimmer.trim_if_needed(messages)
+
+    flattened = json.dumps(trimmed, ensure_ascii=False)
+    assert '"id": "head"' in flattened and '"tool_use_id": "head"' in flattened
+    assert ('"id": "tail"' in flattened) == ('"tool_use_id": "tail"' in flattened)
+    completed = next(event for event in events.read_events() if event["type"] == "context_message_trim_completed")
+    assert completed["payload"]["boundary_expanded"] is True
+
+
+def test_message_trimmer_skips_malformed_tool_protocol_without_archiving(tmp_path: Path):
+    events = EventStore(tmp_path, "malformed")
+    manager = ContextManager(ArtifactStore(events.run_dir, events), events)
+    trimmer = MessageCountTrimmer(manager, events, trigger=60, keep_head=3, keep_tail=47)
+    messages = [{"role": "user", "content": "initial"}, *_tool_pair("valid")]
+    messages.extend({"role": "user", "content": f"m-{i}"} for i in range(58))
+    messages[2]["content"][0]["tool_use_id"] = "wrong-id"
+
+    unchanged = trimmer.trim_if_needed(messages)
+
+    assert unchanged is messages
+    assert not manager.store.list_metadata()
+    skipped = next(event for event in events.read_events() if event["type"] == "context_message_trim_skipped")
+    assert skipped["payload"]["reason"] == "invalid_tool_protocol"
+
+
+def test_message_trimmer_supports_repeated_archives_and_releases_batch_references(tmp_path: Path):
+    events = EventStore(tmp_path, "repeated")
+    manager = ContextManager(ArtifactStore(events.run_dir, events), events)
+    trimmer = MessageCountTrimmer(manager, events, trigger=60, keep_head=3, keep_tail=47)
+    messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"first-{i}"} for i in range(80)]
+    first = trimmer.trim_if_needed(messages)
+    second_input = [*first, *(
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"second-{i}"}
+        for i in range(11)
+    )]
+    second = trimmer.trim_if_needed(second_input)
+
+    archives = [item for item in manager.store.list_metadata() if item.details.get("reason") == "message_count_trim"]
+    assert len(archives) == 2
+    assert all(artifact.artifact_id in json.dumps(second, ensure_ascii=False) for artifact in archives)
+
+    result = make_result("forgotten", "small")
+    manager.register_batch([("read_file", result)])
+    manager.forget_results([{"role": "user", "content": [result]}])
+    assert manager.batches == []

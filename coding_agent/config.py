@@ -31,6 +31,9 @@ class AgentConfig:
     context_compaction_target_tokens: int = 25_000
     context_summary_max_tokens: int = 12_000
     context_summary_retry_count: int = 1
+    context_message_trim_trigger: int = 60
+    context_message_keep_head: int = 3
+    context_message_keep_tail: int = 47
 
     @classmethod
     def load(cls, workspace: Path) -> "AgentConfig":
@@ -69,4 +72,12 @@ class AgentConfig:
             raise ValueError("context_summary_max_tokens must be between 256 and the compaction target")
         if not 0 <= config.context_summary_retry_count <= 3:
             raise ValueError("context_summary_retry_count must be between 0 and 3")
+        if not 10 <= config.context_message_trim_trigger <= 10_000:
+            raise ValueError("context_message_trim_trigger must be between 10 and 10000")
+        if not 1 <= config.context_message_keep_head < config.context_message_trim_trigger:
+            raise ValueError("context_message_keep_head must be positive and below the trim trigger")
+        if not 1 <= config.context_message_keep_tail < config.context_message_trim_trigger:
+            raise ValueError("context_message_keep_tail must be positive and below the trim trigger")
+        if config.context_message_keep_head + config.context_message_keep_tail >= config.context_message_trim_trigger:
+            raise ValueError("message head and tail retention must leave trim hysteresis")
         return config
