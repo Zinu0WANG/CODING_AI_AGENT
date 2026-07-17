@@ -2,7 +2,9 @@ import json
 from pathlib import Path
 
 from coding_agent.config import AgentConfig
+from coding_agent.events import EventStore
 from coding_agent.runtime import AgentRuntime, FakeModel
+from coding_agent.tools import ToolRegistry
 
 
 def test_fake_model_run_writes_file_records_events_and_validates(tmp_path: Path):
@@ -201,3 +203,56 @@ def test_runtime_trims_message_count_before_calling_model_again(tmp_path: Path):
     assert any(item.details.get("reason") == "message_count_trim" for item in runtime.artifacts.list_metadata())
     event_types = [event["type"] for event in runtime.events.read_events()]
     assert "context_message_trim_completed" in event_types
+
+
+class TeamUpdateModel:
+    def __init__(self, fail: bool = False):
+        self.messages = None
+        self.fail = fail
+
+    def create(self, **kwargs):
+        self.messages = kwargs["messages"]
+        if self.fail:
+            raise RuntimeError("model unavailable")
+        return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Saw team update"}]}
+
+
+def test_runtime_auto_receives_and_acknowledges_team_updates(tmp_path: Path):
+    model = TeamUpdateModel()
+    runtime = AgentRuntime(tmp_path, AgentConfig(approval_policy="allow_write"), model, interactive=False)
+    runtime.team.bus.send("tester", "lead", {"answer": "12 tests passed"}, "task_completed", task_id=3)
+    result = runtime.run("Continue coordinating")
+    assert result.status == "completed"
+    assert "TEAM UPDATES" in json.dumps(model.messages)
+    assert "12 tests passed" in json.dumps(model.messages)
+    assert runtime.team.bus.list_messages("lead")[0]["status"] == "acknowledged"
+
+
+def test_runtime_does_not_ack_team_updates_when_model_fails(tmp_path: Path):
+    runtime = AgentRuntime(tmp_path, AgentConfig(approval_policy="allow_write"), TeamUpdateModel(fail=True), interactive=False)
+    runtime.team.bus.send("tester", "lead", "blocked", "blocked", task_id=4)
+    runtime.run("Continue coordinating")
+    assert runtime.team.bus.list_messages("lead")[0]["status"] == "delivered"
+
+
+def test_teammate_tool_registry_enforces_write_scope(tmp_path: Path):
+    registry = ToolRegistry(
+        tmp_path, AgentConfig(approval_policy="allow_write"), EventStore(tmp_path),
+        actor="worker", allowed_write_scope=["src/auth/**"],
+    )
+    assert registry.execute("write_file", {"path": "src/auth/login.py", "content": "ok"}).startswith("Wrote")
+    denied = registry.execute("write_file", {"path": "src/payments.py", "content": "no"})
+    assert "write scope denied" in denied
+    assert not (tmp_path / "src" / "payments.py").exists()
+
+
+def test_scoped_teammate_shell_write_requires_explicit_approval(tmp_path: Path):
+    calls = []
+    registry = ToolRegistry(
+        tmp_path, AgentConfig(approval_policy="allow_write"), EventStore(tmp_path),
+        approval_callback=lambda *args: calls.append(args) or False,
+        actor="worker", allowed_write_scope=["src/**"],
+    )
+    denied = registry.execute("bash", {"command": "python -c \"from pathlib import Path; Path('x').write_text('x')\""})
+    assert "write scope denied" in denied
+    assert len(calls) == 1

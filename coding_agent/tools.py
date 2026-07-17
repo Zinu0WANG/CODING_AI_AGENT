@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import fnmatch
 import json
 import subprocess
 import threading
@@ -22,7 +23,7 @@ ApprovalCallback = Callable[[str, dict, PolicyDecision], bool]
 class ToolRegistry:
     def __init__(self, workspace: Path, config: AgentConfig, events: EventStore,
                  approval_callback: ApprovalCallback | None = None, actor: str = "lead",
-                 artifact_store: ArtifactStore | None = None):
+                 artifact_store: ArtifactStore | None = None, allowed_write_scope: list[str] | None = None):
         self.workspace = workspace.resolve()
         self.config = config
         self.events = events
@@ -30,9 +31,11 @@ class ToolRegistry:
         self.approval_callback = approval_callback
         self.actor = actor
         self.artifact_store = artifact_store or ArtifactStore(events.run_dir, events)
+        self.allowed_write_scope = allowed_write_scope
         self.tasks = TaskManager(self.workspace / ".tasks")
         self.repo_map = RepoMap(self.workspace, config.ignore_patterns, config.max_file_bytes)
         self._approved_for_run: set[RiskLevel] = set()
+        self._explicitly_approved_calls: set[tuple[str, int]] = set()
         self._before: dict[Path, bytes | None] = self._snapshot_workspace()
         self._background: dict[str, dict] = {}
         self._background_lock = threading.Lock()
@@ -63,7 +66,11 @@ class ToolRegistry:
                           "limit": {"type": "integer", "minimum": 1, "maximum": 12000}}, ["artifact_id"]),
             self._schema("artifact_search", "Search externalized tool results and context archives in this run by literal keyword.",
                          {"query": {"type": "string"}, "max_hits": {"type": "integer", "minimum": 1, "maximum": 20}}, ["query"]),
-            self._schema("task_create", "Create a persistent task.", {"subject": {"type": "string"}, "description": {"type": "string"}}, ["subject"]),
+            self._schema("task_create", "Create a persistent task.", {
+                "subject": {"type": "string"}, "description": {"type": "string"},
+                "mode": {"type": "string", "enum": ["read", "write"]},
+                "write_scope": {"type": "array", "items": {"type": "string"}},
+            }, ["subject"]),
             self._schema("task_list", "List persistent tasks.", {}, []),
             self._schema("task_update", "Update a persistent task.", {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]}}, ["task_id"]),
             self._schema("load_skill", "Load a local SKILL.md by name.", {"name": {"type": "string"}}, ["name"]),
@@ -90,6 +97,10 @@ class ToolRegistry:
             return False
         if decision.risk is RiskLevel.READ:
             return True
+        approval_key = (name, id(arguments))
+        if approval_key in self._explicitly_approved_calls:
+            self._explicitly_approved_calls.remove(approval_key)
+            return True
         if self.config.approval_policy == "read_only":
             return False
         if self.config.approval_policy == "allow_write" or decision.risk in self._approved_for_run:
@@ -113,6 +124,11 @@ class ToolRegistry:
             self.events.emit("tool_finished", self.actor, {"tool": name, "ok": False, "output": output})
             return output
         decision = self._decision(name, arguments)
+        scope_error = self._scope_error(name, arguments, decision)
+        if scope_error:
+            output = f"Error: write scope denied: {scope_error}"
+            self.events.emit("tool_finished", self.actor, {"tool": name, "ok": False, "output": output, "risk": decision.risk.value})
+            return output
         if not self._allowed(name, arguments, decision):
             output = f"Error: {decision.risk.value} operation denied: {decision.reason}"
             self.events.emit("tool_finished", self.actor, {"tool": name, "ok": False, "output": output, "risk": decision.risk.value})
@@ -125,6 +141,30 @@ class ToolRegistry:
             output, ok = f"Error: {exc}", False
         self.events.emit("tool_finished", self.actor, {"tool": name, "ok": ok, "output": output[:2000]})
         return output[:50_000]
+
+    def _scope_error(self, name: str, arguments: dict, decision: PolicyDecision) -> str | None:
+        if self.allowed_write_scope is None or decision.risk is not RiskLevel.WRITE:
+            return None
+        if name in {"write_file", "edit_file"}:
+            relative = self.policy.resolve_path(arguments["path"]).relative_to(self.workspace).as_posix()
+            for pattern in self.allowed_write_scope:
+                normalized = pattern.replace("\\", "/").lstrip("./")
+                if fnmatch.fnmatchcase(relative, normalized) or (
+                    normalized.endswith("/**") and relative.startswith(normalized[:-3].rstrip("/") + "/")
+                ):
+                    return None
+            return f"{relative} is outside {self.allowed_write_scope}"
+        if name in {"bash", "background_run"}:
+            # Shell side effects cannot be mapped reliably to paths. Require an explicit human approval.
+            decision = PolicyDecision(decision.risk, "shell write target cannot be proven to stay inside teammate write_scope")
+            self.events.emit("approval_requested", self.actor, {"tool": name, "arguments": arguments,
+                             "risk": decision.risk.value, "reason": decision.reason})
+            approved = bool(self.approval_callback and self.approval_callback(name, arguments, decision))
+            self.events.emit("approval_resolved", self.actor, {"tool": name, "approved": approved})
+            if approved:
+                self._explicitly_approved_calls.add((name, id(arguments)))
+            return None if approved else decision.reason
+        return None
 
     def _remember(self, path: Path) -> None:
         if path not in self._before:
@@ -189,7 +229,8 @@ class ToolRegistry:
                     return json.dumps(task, ensure_ascii=False) if task else f"Error: unknown background task {task_id}"
                 return json.dumps(self._background, ensure_ascii=False)
         if name == "task_create":
-            return self.tasks.create(arguments["subject"], arguments.get("description", ""))
+            return self.tasks.create(arguments["subject"], arguments.get("description", ""),
+                                     arguments.get("mode", "read"), arguments.get("write_scope", []))
         if name == "task_list":
             return self.tasks.list_all()
         if name == "task_update":
