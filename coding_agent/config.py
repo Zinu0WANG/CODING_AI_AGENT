@@ -26,6 +26,11 @@ class AgentConfig:
     artifact_threshold_tokens: int = 1000
     artifact_read_default_chars: int = 8000
     artifact_search_max_hits: int = 5
+    context_window_tokens: int = 128_000
+    context_compaction_trigger_ratio: float = 0.70
+    context_compaction_target_tokens: int = 25_000
+    context_summary_max_tokens: int = 12_000
+    context_summary_retry_count: int = 1
 
     @classmethod
     def load(cls, workspace: Path) -> "AgentConfig":
@@ -53,4 +58,15 @@ class AgentConfig:
             raise ValueError("artifact_read_default_chars must be between 1 and 12000")
         if not 1 <= config.artifact_search_max_hits <= 20:
             raise ValueError("artifact_search_max_hits must be between 1 and 20")
+        if not 16_000 <= config.context_window_tokens <= 2_000_000:
+            raise ValueError("context_window_tokens must be between 16000 and 2000000")
+        if not 0.1 <= config.context_compaction_trigger_ratio <= 0.95:
+            raise ValueError("context_compaction_trigger_ratio must be between 0.1 and 0.95")
+        trigger_tokens = int(config.context_window_tokens * config.context_compaction_trigger_ratio)
+        if not 1_000 <= config.context_compaction_target_tokens < trigger_tokens:
+            raise ValueError("context_compaction_target_tokens must be at least 1000 and below the trigger")
+        if not 256 <= config.context_summary_max_tokens <= config.context_compaction_target_tokens:
+            raise ValueError("context_summary_max_tokens must be between 256 and the compaction target")
+        if not 0 <= config.context_summary_retry_count <= 3:
+            raise ValueError("context_summary_retry_count must be between 0 and 3")
         return config

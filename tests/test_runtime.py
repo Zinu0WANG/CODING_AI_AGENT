@@ -142,3 +142,35 @@ def test_runtime_externalizes_searches_and_reads_old_tool_results(tmp_path: Path
     assert "artifact_created" in event_types
     assert "context_externalized" in event_types
     assert event_types.count("artifact_accessed") == 2
+
+
+class CompactingModel:
+    def __init__(self):
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs["tools"] == []:
+            return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Goal and decisions preserved"}]}
+        return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Finished after compaction"}]}
+
+
+def test_runtime_compacts_large_prompt_with_toolless_summary_call(tmp_path: Path):
+    model = CompactingModel()
+    config = AgentConfig(
+        approval_policy="allow_write", context_window_tokens=16000,
+        context_compaction_trigger_ratio=0.5, context_compaction_target_tokens=4000,
+        context_summary_max_tokens=1000,
+    )
+    runtime = AgentRuntime(tmp_path, config, model, interactive=False)
+    result = runtime.run("PRESERVE-ME " + "x" * 1000)
+
+    assert result.status == "completed"
+    assert len(model.calls) == 2
+    assert model.calls[0]["tools"] == []
+    assert model.calls[0]["max_tokens"] <= 1000
+    assert "Goal and decisions preserved" in model.calls[1]["messages"][0]["content"]
+    assert any(item.kind == "context_archive" for item in runtime.artifacts.list_metadata())
+    event_types = [event["type"] for event in runtime.events.read_events()]
+    assert "context_compaction_started" in event_types
+    assert "context_compaction_completed" in event_types

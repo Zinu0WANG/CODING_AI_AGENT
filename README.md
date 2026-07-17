@@ -62,6 +62,11 @@ context_keep_tool_batches: 3
 artifact_threshold_tokens: 1000
 artifact_read_default_chars: 8000
 artifact_search_max_hits: 5
+context_window_tokens: 128000
+context_compaction_trigger_ratio: 0.70
+context_compaction_target_tokens: 25000
+context_summary_max_tokens: 12000
+context_summary_retry_count: 1
 ```
 
 配置文件中的 lint/test 命令被视为仓库所有者提供的可信命令。模型临时生成的 Shell 命令仍经过策略判断。

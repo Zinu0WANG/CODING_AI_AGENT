@@ -3,7 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from coding_agent.context_management import ArtifactStore, ContextManager, estimate_tokens
+from coding_agent.context_management import (
+    ArtifactStore,
+    ContextManager,
+    ConversationCompactor,
+    estimate_request_tokens,
+    estimate_tokens,
+)
 from coding_agent.events import EventStore
 
 
@@ -32,6 +38,22 @@ def test_artifact_store_writes_index_reads_pages_and_searches(tmp_path: Path):
     assert "NEEDLE" in hits[0]["snippet"]
     index = [json.loads(line) for line in store.index_path.read_text(encoding="utf-8").splitlines()]
     assert index[0]["sha256"] == artifact.sha256
+
+
+def test_context_archive_is_searchable_and_exposes_safe_metadata(tmp_path: Path):
+    events = EventStore(tmp_path, "run-archive")
+    store = ArtifactStore(events.run_dir, events)
+    archive = store.create(
+        "context_compactor", '{"messages":[{"role":"user","content":"OLD-DECISION"}]}',
+        "success", kind="context_archive",
+        details={"message_start": 0, "message_end": 1, "roles": ["user"]},
+    )
+
+    hit = store.search("old-decision")[0]
+    assert hit["artifact_id"] == archive.artifact_id
+    assert hit["kind"] == "context_archive"
+    assert hit["details"]["roles"] == ["user"]
+    assert store.read(archive.artifact_id)["kind"] == "context_archive"
 
 
 def test_artifact_store_rejects_missing_corrupt_and_cross_run_ids(tmp_path: Path):
@@ -97,3 +119,116 @@ def test_context_manager_marks_failed_shell_results_as_errors(tmp_path: Path):
     manager.compact()
     assert "status=error" in failed["content"]
     assert store.list_metadata()[0].status == "error"
+
+
+def test_request_estimate_includes_system_tools_messages_and_output_reserve():
+    estimated = estimate_request_tokens(
+        "s" * 40,
+        [{"role": "user", "content": "m" * 40}],
+        [{"name": "tool", "description": "t" * 40}],
+        output_reserve_tokens=8000,
+    )
+    assert estimated >= 8030
+
+
+def test_compactor_does_nothing_below_seventy_percent_threshold(tmp_path: Path):
+    events = EventStore(tmp_path, "below-threshold")
+    manager = ContextManager(ArtifactStore(events.run_dir, events), events)
+    messages = [{"role": "user", "content": "small request"}]
+    compactor = ConversationCompactor(
+        manager, events, window_tokens=128000, trigger_ratio=0.70,
+        target_tokens=25000, summary_max_tokens=12000, summary_retry_count=1,
+    )
+
+    unchanged = compactor.compact_if_needed(
+        "system", messages, [], lambda _archive, _limit: "must not run",
+    )
+
+    assert unchanged is messages
+    assert not manager.store.list_metadata()
+    assert not any(event["type"].startswith("context_compaction") for event in events.read_events())
+
+
+def test_compactor_archives_complete_tool_pair_and_injects_summary(tmp_path: Path):
+    events = EventStore(tmp_path, "compact")
+    manager = ContextManager(ArtifactStore(events.run_dir, events), events, keep_batches=1, threshold_tokens=10)
+    old_result = make_result("old-tool", "OLD-RESULT " + "x" * 300)
+    new_result = make_result("new-tool", "NEW-RESULT " + "y" * 80)
+    messages = [
+        {"role": "user", "content": "ORIGINAL-GOAL " + "g" * 200},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "old-tool", "name": "read_file", "input": {}}]},
+        {"role": "user", "content": [old_result]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "new-tool", "name": "read_file", "input": {}}]},
+        {"role": "user", "content": [new_result]},
+    ]
+    manager.register_batch([("read_file", old_result)])
+    manager.register_batch([("read_file", new_result)])
+    compactor = ConversationCompactor(
+        manager, events, window_tokens=600, trigger_ratio=0.2,
+        target_tokens=220, summary_max_tokens=80, summary_retry_count=1,
+        output_reserve_tokens=20,
+    )
+
+    compacted = compactor.compact_if_needed(
+        "system", messages, [], lambda archive, _limit: "Structured summary for ORIGINAL-GOAL",
+    )
+
+    assert compacted is not messages
+    assert "Structured summary" in compacted[0]["content"]
+    archives = [item for item in manager.store.list_metadata() if item.kind == "context_archive"]
+    assert len(archives) == 1
+    archived = manager.store.read(archives[0].artifact_id)["content"]
+    assert "ORIGINAL-GOAL" in archived
+    assert ('"id": "old-tool"' in archived) == ('"tool_use_id": "old-tool"' in archived)
+    event_types = [event["type"] for event in events.read_events()]
+    assert event_types.index("context_archive_created") < event_types.index("context_compaction_completed")
+
+
+def test_compactor_retries_then_uses_local_fallback_without_losing_archive(tmp_path: Path):
+    events = EventStore(tmp_path, "fallback")
+    manager = ContextManager(ArtifactStore(events.run_dir, events), events, keep_batches=0, threshold_tokens=10)
+    compactor = ConversationCompactor(
+        manager, events, window_tokens=200, trigger_ratio=0.5,
+        target_tokens=80, summary_max_tokens=30, summary_retry_count=1,
+        output_reserve_tokens=10,
+    )
+    calls = 0
+
+    def fail_summary(_archive: str, _limit: int) -> str:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("summary unavailable")
+
+    compacted = compactor.compact_if_needed(
+        "system", [{"role": "user", "content": "IMPORTANT " + "x" * 500}], [], fail_summary,
+    )
+
+    assert calls == 2
+    assert "Automatic fallback summary" in compacted[0]["content"]
+    assert "artifact" in compacted[0]["content"]
+    assert any(item.kind == "context_archive" for item in manager.store.list_metadata())
+    assert "context_compaction_failed" in [event["type"] for event in events.read_events()]
+
+
+def test_compactor_bounds_summary_request_but_keeps_complete_archive(tmp_path: Path):
+    events = EventStore(tmp_path, "oversized")
+    manager = ContextManager(ArtifactStore(events.run_dir, events), events)
+    compactor = ConversationCompactor(
+        manager, events, window_tokens=16000, trigger_ratio=0.5,
+        target_tokens=4000, summary_max_tokens=1000, summary_retry_count=0,
+        output_reserve_tokens=100,
+    )
+    original = "HEAD-MARKER " + "x" * 80000 + " TAIL-MARKER"
+    received = ""
+
+    def summarize(archive: str, _limit: int) -> str:
+        nonlocal received
+        received = archive
+        return "bounded summary"
+
+    compactor.compact_if_needed("system", [{"role": "user", "content": original}], [], summarize)
+
+    assert "HEAD-MARKER" in received and "TAIL-MARKER" in received
+    assert "middle omitted" in received
+    archive = next(item for item in manager.store.list_metadata() if item.kind == "context_archive")
+    assert original in manager.store.artifact_path(archive.artifact_id).read_text(encoding="utf-8")

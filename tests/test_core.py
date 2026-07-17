@@ -22,8 +22,24 @@ def test_config_loads_defaults_and_project_overrides(tmp_path: Path):
     assert ".git/**" in config.ignore_patterns
     assert config.context_keep_tool_batches == 3
     assert config.artifact_threshold_tokens == 1000
+    assert config.context_window_tokens == 128000
+    assert config.context_compaction_trigger_ratio == 0.70
+    assert config.context_compaction_target_tokens == 25000
+    assert config.context_summary_max_tokens == 12000
+    assert config.context_summary_retry_count == 1
     assert config.artifact_read_default_chars == 8000
     assert config.artifact_search_max_hits == 5
+
+
+def test_config_rejects_compaction_target_at_or_above_trigger(tmp_path: Path):
+    (tmp_path / ".agent.yml").write_text(
+        "context_window_tokens: 128000\n"
+        "context_compaction_trigger_ratio: 0.7\n"
+        "context_compaction_target_tokens: 90000\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="below the trigger"):
+        AgentConfig.load(tmp_path)
 
 
 def test_event_store_round_trips_and_tolerates_corrupt_lines(tmp_path: Path):

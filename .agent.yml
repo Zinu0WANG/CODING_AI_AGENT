@@ -10,3 +10,8 @@ context_keep_tool_batches: 3
 artifact_threshold_tokens: 1000
 artifact_read_default_chars: 8000
 artifact_search_max_hits: 5
+context_window_tokens: 128000
+context_compaction_trigger_ratio: 0.70
+context_compaction_target_tokens: 25000
+context_summary_max_tokens: 12000
+context_summary_retry_count: 1
