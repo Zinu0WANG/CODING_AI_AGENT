@@ -58,6 +58,10 @@ approval_policy: ask_on_write  # ask_on_write | allow_write | read_only
 max_steps: 40
 max_fix_attempts: 2
 command_timeout: 120
+context_keep_tool_batches: 3
+artifact_threshold_tokens: 1000
+artifact_read_default_chars: 8000
+artifact_search_max_hits: 5
 ```
 
 配置文件中的 lint/test 命令被视为仓库所有者提供的可信命令。模型临时生成的 Shell 命令仍经过策略判断。
@@ -111,7 +115,25 @@ CLI
 - `policy` 是模型输出与物理执行之间的应用层信任边界。
 - `events` 提供 append-only 轨迹与派生指标。
 - `context` 负责低成本仓库理解。
+- `context_management` 将三批之前的大型工具结果外置为当前 Run 的 artifact，并提供关键词搜索和分页取回。
 - `team` 与 `state` 负责协作和并发一致性。
+
+## 上下文与 Artifacts
+
+当前 Run 最近三次工具调用批次保留完整结果。更早批次中超过约 1000 Token 的结果会写入：
+
+```text
+.runs/<run_id>/artifacts/
+├── index.jsonl
+└── <artifact_id>.txt
+```
+
+原 `tool_result` 仍保留 `tool_use_id`，但正文会替换成短引用。模型可调用：
+
+- `artifact_search(query)`：在当前 Run 的外置结果中按关键词查找。
+- `artifact_read(artifact_id, offset, limit)`：按字符分页取回，单页最多 12000 字符。
+
+Artifact 只在当前 Run 内检索，不会自动进入下一次任务；内容为本地明文，并随 `.runs/` 一起被 Git 忽略。
 
 ## 测试
 
@@ -120,7 +142,7 @@ python -m pytest -q
 python -m compileall -q agent.py coding_agent
 ```
 
-测试覆盖配置、事件损坏恢复、路径穿越、命令风险、RepoMap、并发信箱、原子任务认领、Fake Model 端到端运行、危险命令拒绝、审批拒绝、质量门禁重试和只读回放。
+测试覆盖配置、事件损坏恢复、路径穿越、命令风险、RepoMap、并发信箱、原子任务认领、Fake Model 端到端运行、危险命令拒绝、审批拒绝、质量门禁重试、只读回放，以及大型工具结果的外置、搜索和分页取回。
 
 ## 运行数据
 
