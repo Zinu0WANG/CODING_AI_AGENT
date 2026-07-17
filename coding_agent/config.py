@@ -34,6 +34,13 @@ class AgentConfig:
     context_message_trim_trigger: int = 60
     context_message_keep_head: int = 3
     context_message_keep_tail: int = 47
+    team_auto_receive: bool = True
+    team_message_batch_size: int = 20
+    team_message_token_limit: int = 4000
+    team_delivery_timeout_seconds: int = 60
+    team_session_recent_messages: int = 12
+    team_session_summary_tokens: int = 2000
+    team_require_write_scope: bool = True
 
     @classmethod
     def load(cls, workspace: Path) -> "AgentConfig":
@@ -80,4 +87,14 @@ class AgentConfig:
             raise ValueError("context_message_keep_tail must be positive and below the trim trigger")
         if config.context_message_keep_head + config.context_message_keep_tail >= config.context_message_trim_trigger:
             raise ValueError("message head and tail retention must leave trim hysteresis")
+        if not 1 <= config.team_message_batch_size <= 100:
+            raise ValueError("team_message_batch_size must be between 1 and 100")
+        if not 256 <= config.team_message_token_limit <= 32000:
+            raise ValueError("team_message_token_limit must be between 256 and 32000")
+        if not 1 <= config.team_delivery_timeout_seconds <= 3600:
+            raise ValueError("team_delivery_timeout_seconds must be between 1 and 3600")
+        if not 1 <= config.team_session_recent_messages <= 100:
+            raise ValueError("team_session_recent_messages must be between 1 and 100")
+        if not 256 <= config.team_session_summary_tokens <= 12000:
+            raise ValueError("team_session_summary_tokens must be between 256 and 12000")
         return config

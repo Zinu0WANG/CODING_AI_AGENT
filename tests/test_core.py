@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,13 @@ def test_config_loads_defaults_and_project_overrides(tmp_path: Path):
     assert config.context_message_keep_tail == 47
     assert config.artifact_read_default_chars == 8000
     assert config.artifact_search_max_hits == 5
+    assert config.team_auto_receive is True
+    assert config.team_message_batch_size == 20
+    assert config.team_message_token_limit == 4000
+    assert config.team_delivery_timeout_seconds == 60
+    assert config.team_session_recent_messages == 12
+    assert config.team_session_summary_tokens == 2000
+    assert config.team_require_write_scope is True
 
 
 def test_config_rejects_compaction_target_at_or_above_trigger(tmp_path: Path):
@@ -100,19 +108,46 @@ def test_validate_name_rejects_path_traversal():
         validate_name("../lead")
 
 
-def test_message_bus_concurrent_send_and_drain_loses_no_messages(tmp_path: Path):
-    bus = MessageBus(tmp_path / "inbox")
+def test_message_bus_concurrent_send_receive_and_ack_loses_no_messages(tmp_path: Path):
+    bus = MessageBus(tmp_path / "team.db")
     threads = [
         threading.Thread(target=bus.send, args=(f"sender-{i}", "lead", f"message-{i}"))
-        for i in range(30)
+        for i in range(100)
     ]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    messages = bus.read_inbox("lead")
-    assert {message["content"] for message in messages} == {f"message-{i}" for i in range(30)}
-    assert bus.read_inbox("lead") == []
+    messages = bus.receive("lead", limit=100)
+    assert {message["content"] for message in messages} == {f"message-{i}" for i in range(100)}
+    assert all(message["status"] == "delivered" for message in messages)
+    assert bus.receive("lead", limit=100) == []
+    assert bus.ack([message["message_id"] for message in messages], "lead") == 100
+    assert len(bus.list_messages("lead", status="acknowledged", limit=100)) == 100
+
+
+def test_message_bus_redelivers_unacknowledged_messages(tmp_path: Path):
+    bus = MessageBus(tmp_path / "team.db", delivery_timeout=0.01)
+    bus.send("tester", "lead", {"summary": "done"}, "task_completed", task_id=7)
+    first = bus.receive("lead")[0]
+    time.sleep(0.02)
+    second = bus.receive("lead")[0]
+    assert second["message_id"] == first["message_id"]
+    assert second["delivery_attempts"] == 2
+
+
+def test_message_bus_imports_legacy_jsonl_once(tmp_path: Path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "lead.jsonl").write_text(
+        json.dumps({"type": "message", "from": "tester", "content": "legacy"}) + "\n",
+        encoding="utf-8",
+    )
+    bus = MessageBus(tmp_path / "team.db", legacy_inbox_dir=inbox)
+    assert bus.receive("lead")[0]["content"] == "legacy"
+    assert (inbox / "lead.jsonl.migrated").exists()
+    MessageBus(tmp_path / "team.db", legacy_inbox_dir=inbox)
+    assert len(bus.list_messages("lead")) == 1
 
 
 def test_task_claim_is_atomic(tmp_path: Path):
@@ -146,3 +181,19 @@ def test_task_claim_is_atomic_across_manager_instances(tmp_path: Path):
     for thread in threads:
         thread.join()
     assert sum(result.startswith("Claimed") for result in results) == 1
+
+
+def test_write_scope_conflicts_block_parallel_claims(tmp_path: Path):
+    manager = TaskManager(tmp_path / "tasks")
+    first = json.loads(manager.create("Edit auth", mode="write", write_scope=["src/auth/**"]))
+    second = json.loads(manager.create("Edit login", mode="write", write_scope=["src/auth/login.py"]))
+    assert manager.claim(first["id"], "one").startswith("Claimed")
+    assert "scope conflict" in manager.claim(second["id"], "two")
+
+
+def test_read_tasks_do_not_claim_write_scope(tmp_path: Path):
+    manager = TaskManager(tmp_path / "tasks")
+    first = json.loads(manager.create("Inspect", mode="read"))
+    second = json.loads(manager.create("Edit", mode="write", write_scope=["src/**"]))
+    assert manager.claim(first["id"], "reader").startswith("Claimed")
+    assert manager.claim(second["id"], "writer").startswith("Claimed")
