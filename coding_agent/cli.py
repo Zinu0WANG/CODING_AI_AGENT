@@ -31,6 +31,10 @@ class AgentCLI:
         if not model_name:
             raise RuntimeError("MODEL_ID is required; copy .env.example to .env")
         kwargs = {}
+        api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY or DASHSCOPE_API_KEY is required")
+        kwargs["api_key"] = api_key
         if os.getenv("ANTHROPIC_BASE_URL"):
             os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
             kwargs["base_url"] = os.environ["ANTHROPIC_BASE_URL"]

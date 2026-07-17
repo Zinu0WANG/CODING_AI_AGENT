@@ -32,6 +32,17 @@ ANTHROPIC_BASE_URL=https://provider.example/anthropic
 MODEL_ID=provider-model-id
 ```
 
+阿里云百炼千问示例：
+
+```dotenv
+DASHSCOPE_API_KEY=你的新密钥
+MODEL_ID=qwen3.7-plus
+ANTHROPIC_BASE_URL=https://dashscope.aliyuncs.com/apps/anthropic
+```
+
+如果使用百炼子工作空间专属域名，将 Base URL 改为
+`https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/apps/anthropic`。Base URL 不要追加 `/v1`。
+
 ## 项目配置
 
 在工作区根目录使用 `.agent.yml`：
