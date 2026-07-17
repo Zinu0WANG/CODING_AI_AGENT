@@ -20,6 +20,10 @@ def test_config_loads_defaults_and_project_overrides(tmp_path: Path):
     assert config.test_commands == ["python -m pytest -q"]
     assert config.max_steps == 12
     assert ".git/**" in config.ignore_patterns
+    assert config.context_keep_tool_batches == 3
+    assert config.artifact_threshold_tokens == 1000
+    assert config.artifact_read_default_chars == 8000
+    assert config.artifact_search_max_hits == 5
 
 
 def test_event_store_round_trips_and_tolerates_corrupt_lines(tmp_path: Path):

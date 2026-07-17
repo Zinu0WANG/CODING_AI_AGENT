@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from coding_agent.config import AgentConfig
@@ -97,3 +98,47 @@ def test_diff_captures_files_changed_by_shell_commands(tmp_path: Path):
     result = runtime.run("Create via shell")
     assert "shell.txt" in result.diff
     assert "+created" in result.diff
+
+
+class ArtifactRetrievalModel:
+    def __init__(self):
+        self.call = 0
+        self.saw_externalized_context = False
+        self.artifact_id = None
+
+    def create(self, **kwargs):
+        self.call += 1
+        messages = kwargs["messages"]
+        if self.call <= 4:
+            return {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": f"read-{self.call}",
+                    "name": "read_file", "input": {"path": "large.txt", "reason": "integration test"}}]}
+        if self.call == 5:
+            first_result = messages[2]["content"][0]
+            self.saw_externalized_context = first_result["tool_use_id"] == "read-1" and "[artifact:" in first_result["content"]
+            return {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "search",
+                    "name": "artifact_search", "input": {"query": "UNIQUE-MARKER"}}]}
+        if self.call == 6:
+            search_result = json.loads(messages[-1]["content"][0]["content"])
+            self.artifact_id = search_result[0]["artifact_id"]
+            return {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "artifact-read",
+                    "name": "artifact_read", "input": {"artifact_id": self.artifact_id, "offset": 0, "limit": 100}}]}
+        assert "UNIQUE-MARKER" in json.loads(messages[-1]["content"][0]["content"])["content"]
+        return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Recovered artifact"}]}
+
+
+def test_runtime_externalizes_searches_and_reads_old_tool_results(tmp_path: Path):
+    (tmp_path / "large.txt").write_text("UNIQUE-MARKER " + "x" * 5000, encoding="utf-8")
+    model = ArtifactRetrievalModel()
+    config = AgentConfig(approval_policy="allow_write", context_keep_tool_batches=3,
+                         artifact_threshold_tokens=1000)
+    runtime = AgentRuntime(tmp_path, config, model, interactive=False)
+    result = runtime.run("Read and later recover a large result")
+
+    assert result.status == "completed"
+    assert result.answer == "Recovered artifact"
+    assert model.saw_externalized_context
+    assert model.artifact_id
+    event_types = [event["type"] for event in runtime.events.read_events()]
+    assert "artifact_created" in event_types
+    assert "context_externalized" in event_types
+    assert event_types.count("artifact_accessed") == 2

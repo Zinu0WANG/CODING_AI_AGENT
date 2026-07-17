@@ -72,6 +72,8 @@ class ArtifactStore:
         digest = hashlib.sha256(encoded).hexdigest()
         with self._lock:
             artifact_id = uuid.uuid4().hex[:12]
+            while self.artifact_path(artifact_id).exists():
+                artifact_id = uuid.uuid4().hex[:12]
             path = self.artifact_path(artifact_id)
             temporary = path.with_suffix(f".tmp-{uuid.uuid4().hex}")
             temporary.write_bytes(encoded)
@@ -87,8 +89,8 @@ class ArtifactStore:
             self.events.emit("artifact_created", "runtime", asdict(metadata))
             return metadata
 
-    def _verified_content(self, artifact_id: str) -> tuple[ArtifactMetadata, str]:
-        metadata = self._metadata().get(artifact_id)
+    def _verified_content(self, artifact_id: str, metadata: ArtifactMetadata | None = None) -> tuple[ArtifactMetadata, str]:
+        metadata = metadata or self._metadata().get(artifact_id)
         if not metadata:
             raise ValueError("unknown artifact")
         path = self.artifact_path(artifact_id)
@@ -120,13 +122,15 @@ class ArtifactStore:
         query = query.strip()
         if not query:
             raise ValueError("query is required")
+        if len(query) > 200:
+            raise ValueError("query must be at most 200 characters")
         if not 1 <= max_hits <= 20:
             raise ValueError("max_hits must be between 1 and 20")
         hits = []
         with self._lock:
             for metadata in self._metadata().values():
                 try:
-                    _, content = self._verified_content(metadata.artifact_id)
+                    _, content = self._verified_content(metadata.artifact_id, metadata)
                 except ValueError:
                     continue
                 index = content.casefold().find(query.casefold())
@@ -173,7 +177,8 @@ class ContextManager:
                 tokens = estimate_tokens(content)
                 if tokens <= self.threshold_tokens:
                     continue
-                status = "error" if content.startswith("Error:") else "success"
+                failed_exit = content.startswith("exit_code=") and not content.startswith("exit_code=0\n")
+                status = "error" if content.startswith("Error:") or failed_exit else "success"
                 metadata = self.store.create(reference.tool, content, status, tokens)
                 reference.result["content"] = (
                     f"[artifact: {metadata.artifact_id}]\n"

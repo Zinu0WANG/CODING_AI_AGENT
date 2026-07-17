@@ -10,6 +10,7 @@ from typing import Callable
 
 from .config import AgentConfig
 from .context import RepoMap
+from .context_management import ArtifactStore
 from .events import EventStore
 from .policy import PolicyDecision, RiskLevel, ToolPolicy
 from .state import TaskManager
@@ -20,13 +21,15 @@ ApprovalCallback = Callable[[str, dict, PolicyDecision], bool]
 
 class ToolRegistry:
     def __init__(self, workspace: Path, config: AgentConfig, events: EventStore,
-                 approval_callback: ApprovalCallback | None = None, actor: str = "lead"):
+                 approval_callback: ApprovalCallback | None = None, actor: str = "lead",
+                 artifact_store: ArtifactStore | None = None):
         self.workspace = workspace.resolve()
         self.config = config
         self.events = events
         self.policy = ToolPolicy(self.workspace)
         self.approval_callback = approval_callback
         self.actor = actor
+        self.artifact_store = artifact_store or ArtifactStore(events.run_dir, events)
         self.tasks = TaskManager(self.workspace / ".tasks")
         self.repo_map = RepoMap(self.workspace, config.ignore_patterns, config.max_file_bytes)
         self._approved_for_run: set[RiskLevel] = set()
@@ -55,6 +58,11 @@ class ToolRegistry:
             self._schema("repo_map", "Refresh and show the repository map.", {}, []),
             self._schema("background_run", "Run an approved command in a background thread.", {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"]),
             self._schema("check_background", "Check one or all background commands.", {"task_id": {"type": "string"}}, []),
+            self._schema("artifact_read", "Read a page from a tool result externalized in this run.",
+                         {"artifact_id": {"type": "string"}, "offset": {"type": "integer", "minimum": 0},
+                          "limit": {"type": "integer", "minimum": 1, "maximum": 12000}}, ["artifact_id"]),
+            self._schema("artifact_search", "Search externalized tool results in this run by literal keyword.",
+                         {"query": {"type": "string"}, "max_hits": {"type": "integer", "minimum": 1, "maximum": 20}}, ["query"]),
             self._schema("task_create", "Create a persistent task.", {"subject": {"type": "string"}, "description": {"type": "string"}}, ["subject"]),
             self._schema("task_list", "List persistent tasks.", {}, []),
             self._schema("task_update", "Update a persistent task.", {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]}}, ["task_id"]),
@@ -153,6 +161,17 @@ class ToolRegistry:
             return f"Edited {arguments['path']}"
         if name == "repo_map":
             return self.repo_map.render()
+        if name == "artifact_read":
+            result = self.artifact_store.read(
+                arguments["artifact_id"], arguments.get("offset", 0),
+                arguments.get("limit", self.config.artifact_read_default_chars),
+            )
+            return json.dumps(result, ensure_ascii=False)
+        if name == "artifact_search":
+            result = self.artifact_store.search(
+                arguments["query"], arguments.get("max_hits", self.config.artifact_search_max_hits),
+            )
+            return json.dumps(result, ensure_ascii=False)
         if name == "background_run":
             task_id = str(uuid.uuid4())[:8]
             with self._background_lock:

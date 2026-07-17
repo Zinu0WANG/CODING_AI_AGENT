@@ -48,6 +48,8 @@ def test_artifact_store_rejects_missing_corrupt_and_cross_run_ids(tmp_path: Path
         first.read(artifact.artifact_id)
     with pytest.raises(ValueError, match="unknown artifact"):
         first.read("not-an-id")
+    with pytest.raises(ValueError, match="query must be at most"):
+        first.search("x" * 201)
 
 
 def test_context_manager_externalizes_only_large_results_older_than_three_batches(tmp_path: Path):
@@ -84,3 +86,14 @@ def test_context_manager_keeps_small_old_results_and_groups_parallel_tools(tmp_p
     assert "[artifact:" not in newest["content"]
     manager.compact()
     assert len(manager.store.list_metadata()) == 2
+
+
+def test_context_manager_marks_failed_shell_results_as_errors(tmp_path: Path):
+    events = EventStore(tmp_path, "run")
+    store = ArtifactStore(events.run_dir, events)
+    manager = ContextManager(store, events, keep_batches=0, threshold_tokens=1)
+    failed = make_result("failed", "exit_code=2\n" + "failure " * 20)
+    manager.register_batch([("bash", failed)])
+    manager.compact()
+    assert "status=error" in failed["content"]
+    assert store.list_metadata()[0].status == "error"

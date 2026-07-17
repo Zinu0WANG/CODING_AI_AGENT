@@ -7,6 +7,7 @@ from typing import Any, Protocol
 
 from .config import AgentConfig
 from .context import RepoMap
+from .context_management import ArtifactStore, ContextManager
 from .events import EventStore
 from .policy import PolicyDecision, RiskLevel
 from .tools import ApprovalCallback, ToolRegistry
@@ -75,7 +76,13 @@ class AgentRuntime:
         self.config = config
         self.model = model_client
         self.events = EventStore(self.workspace, run_id)
-        self.tools = ToolRegistry(self.workspace, config, self.events, approval_callback)
+        self.artifacts = ArtifactStore(self.events.run_dir, self.events)
+        self.context = ContextManager(
+            self.artifacts, self.events, config.context_keep_tool_batches,
+            config.artifact_threshold_tokens,
+        )
+        self.tools = ToolRegistry(self.workspace, config, self.events, approval_callback,
+                                  artifact_store=self.artifacts)
         self.interactive = interactive
         self.approval_callback = approval_callback
         self.enable_team = enable_team
@@ -173,6 +180,7 @@ class AgentRuntime:
         fix_attempts = 0
         try:
             for step in range(self.config.max_steps):
+                self.context.compact()
                 response = self.model.create(system=system, messages=messages, tools=self.tool_schemas, max_tokens=8000)
                 blocks = [_block_dict(block) for block in _get(response, "content", [])]
                 usage = _get(response, "usage")
@@ -184,7 +192,9 @@ class AgentRuntime:
                     results = []
                     for block in tool_blocks:
                         output = self._execute_tool(block["name"], block.get("input", {}))
-                        results.append({"type": "tool_result", "tool_use_id": block["id"], "content": output})
+                        result = {"type": "tool_result", "tool_use_id": block["id"], "content": output}
+                        results.append(result)
+                    self.context.register_batch([(block["name"], result) for block, result in zip(tool_blocks, results)])
                     messages.append({"role": "user", "content": results})
                     continue
                 answer = "\n".join(block.get("text", "") for block in blocks if block["type"] == "text").strip()

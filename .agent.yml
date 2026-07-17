@@ -6,3 +6,7 @@ ignore_patterns:
   - build/**
 approval_policy: ask_on_write
 max_steps: 40
+context_keep_tool_batches: 3
+artifact_threshold_tokens: 1000
+artifact_read_default_chars: 8000
+artifact_search_max_hits: 5
