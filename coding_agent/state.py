@@ -8,6 +8,14 @@ from pathlib import Path
 
 
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_LOCK_REGISTRY_GUARD = threading.Lock()
+_LOCK_REGISTRY: dict[str, threading.RLock] = {}
+
+
+def _shared_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve()).lower()
+    with _LOCK_REGISTRY_GUARD:
+        return _LOCK_REGISTRY.setdefault(key, threading.RLock())
 
 
 def validate_name(value: str) -> str:
@@ -20,12 +28,9 @@ class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.inbox_dir = inbox_dir
         self.inbox_dir.mkdir(parents=True, exist_ok=True)
-        self._locks: dict[str, threading.Lock] = {}
-        self._guard = threading.Lock()
 
-    def _lock(self, name: str) -> threading.Lock:
-        with self._guard:
-            return self._locks.setdefault(name, threading.Lock())
+    def _lock(self, name: str) -> threading.RLock:
+        return _shared_lock(self.inbox_dir / f"{name}.jsonl")
 
     def send(self, sender: str, to: str, content: str, msg_type: str = "message", extra: dict | None = None) -> str:
         sender, to = validate_name(sender), validate_name(to)
@@ -71,7 +76,7 @@ class TaskManager:
     def __init__(self, tasks_dir: Path):
         self.tasks_dir = tasks_dir
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
+        self._lock = _shared_lock(self.tasks_dir)
 
     def _path(self, task_id: int) -> Path:
         if not isinstance(task_id, int) or task_id <= 0:

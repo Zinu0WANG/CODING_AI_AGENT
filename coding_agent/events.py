@@ -52,6 +52,23 @@ class EventStore:
                 })
         return events
 
+    def summary(self) -> dict:
+        events = self.read_events()
+        if not events:
+            return {"run_id": self.run_id, "status": "empty", "events": 0, "duration_seconds": 0,
+                    "tool_calls": 0, "input_tokens": 0, "output_tokens": 0}
+        terminal = next((e for e in reversed(events) if e["type"] in {"run_completed", "run_failed"}), None)
+        model_events = [event for event in events if event["type"] == "model_response"]
+        return {
+            "run_id": self.run_id,
+            "status": terminal["type"] if terminal else "running",
+            "events": len(events),
+            "duration_seconds": max(0, events[-1]["timestamp"] - events[0]["timestamp"]),
+            "tool_calls": sum(event["type"] == "tool_requested" for event in events),
+            "input_tokens": sum(event.get("payload", {}).get("usage", {}).get("input_tokens", 0) for event in model_events),
+            "output_tokens": sum(event.get("payload", {}).get("usage", {}).get("output_tokens", 0) for event in model_events),
+        }
+
     @classmethod
     def list_runs(cls, workspace: Path) -> list[dict]:
         root = workspace / ".runs"
@@ -65,7 +82,5 @@ class EventStore:
             store = cls.__new__(cls)
             store.root, store.run_id, store.run_dir, store.events_path = root, directory.name, directory, path
             store._lock = threading.Lock()
-            events = store.read_events()
-            terminal = next((e for e in reversed(events) if e["type"] in {"run_completed", "run_failed"}), None)
-            runs.append({"run_id": directory.name, "events": len(events), "status": terminal["type"] if terminal else "running"})
+            runs.append(store.summary())
         return runs

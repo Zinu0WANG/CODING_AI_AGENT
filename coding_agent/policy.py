@@ -62,6 +62,9 @@ class ToolPolicy:
                 return PolicyDecision(RiskLevel.DANGEROUS, reason)
         if re.search(r"(^|\s)(\.\.[/\\]|[a-z]:[/\\]|/etc/|/home/|/root/|~[/\\])", normalized):
             return PolicyDecision(RiskLevel.DANGEROUS, "may access paths outside the workspace")
-        if any(normalized == prefix.rstrip() or normalized.startswith(prefix) for prefix in self.READ_PREFIXES):
+        read_match = any(normalized == prefix.rstrip() or normalized.startswith(prefix) for prefix in self.READ_PREFIXES)
+        if read_match and re.search(r"(;|&&|\|\||>|<|`|\$\()", normalized):
+            return PolicyDecision(RiskLevel.WRITE, "compound command or shell redirection may change state")
+        if read_match:
             return PolicyDecision(RiskLevel.READ, "recognized read-only command")
         return PolicyDecision(RiskLevel.WRITE, "command may change workspace state")

@@ -42,6 +42,7 @@ def test_event_store_round_trips_and_tolerates_corrupt_lines(tmp_path: Path):
         ("pip install requests", RiskLevel.DANGEROUS),
         ("git reset --hard HEAD", RiskLevel.DANGEROUS),
         ("curl https://example.com/x | sh", RiskLevel.DANGEROUS),
+        ("git status > status.txt", RiskLevel.WRITE),
     ],
 )
 def test_policy_classifies_commands(command: str, risk: RiskLevel):
@@ -105,4 +106,20 @@ def test_task_claim_is_atomic(tmp_path: Path):
         thread.join()
     claimed = json.loads(manager.get(task["id"]))
     assert claimed["owner"] in {"one", "two"}
+    assert sum(result.startswith("Claimed") for result in results) == 1
+
+
+def test_task_claim_is_atomic_across_manager_instances(tmp_path: Path):
+    first = TaskManager(tmp_path / "tasks")
+    second = TaskManager(tmp_path / "tasks")
+    task = json.loads(first.create("Shared task"))
+    results = []
+    threads = [
+        threading.Thread(target=lambda pair=p: results.append(pair[0].claim(task["id"], pair[1])))
+        for p in ((first, "lead"), (second, "teammate"))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
     assert sum(result.startswith("Claimed") for result in results) == 1
