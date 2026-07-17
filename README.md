@@ -1,43 +1,121 @@
-﻿# AI_AGENT_CLAUDE_CODE
-🤖 Agent-Harness: Distributed Multi-Agent System
-"Intelligence is in the Model, but Engineering is in the Harness."
+# Observable Coding Agent Harness
 
-这是一个参考 Anthropic Claude Code 架构实现的 AI Agent 基础设施项目。它不是一个简单的聊天机器人，而是一个具备 感知-推理-执行 闭环的生产级 Agent 运行环境（Harness）。
+一个面向 AI Agent 工程实践与面试演示的 Coding Agent。它不只展示模型答案，还展示 Agent 如何理解仓库、选择工具、请求审批、修改代码、运行质量门禁，以及如何回放完整执行轨迹。
 
-本项目通过 9 个阶段的架构演进，最终实现了一个支持多线程、异步信箱通信、持久化生命周期的 AI 协作团队。
+> 安全说明：命令策略和审批属于应用层安全边界，不是 Docker 或操作系统级沙箱。危险命令默认拒绝，但不要在包含高价值凭据的主机上运行不可信任务。
 
-🏗️ 系统架构 (Architecture)
-系统采用 Lead-Teammate 架构，通过异步消息总线（Message Bus）实现解耦协作：
+## 核心能力
 
+- Anthropic Tool Use 驱动的 ReAct 循环，兼容 Anthropic-compatible Provider。
+- 轻量 RepoMap：文件树、语言、关键配置、Python 顶层符号、Git 状态和增量缓存。
+- 三级工具策略：只读自动允许、写操作按配置审批、删除/安装/联网等危险动作默认拒绝。
+- 每次任务生成独立 Run，记录模型响应、工具调用、审批、上下文选择、验证和最终状态。
+- 修改后自动执行 lint/test；失败结果反馈给 Agent，最多自动修复两轮。
+- Agent 修改前后统一 Diff，不自动 commit、push 或覆盖 Git 历史。
+- 临时子 Agent、具名长期队友、原子任务领取、并发安全 JSONL 信箱和后台命令。
+- Rich 终端界面以及只读历史回放。
 
-✨ 核心特性 (Key Features)
-🚀 自主循环 (ReAct Loop): 深度集成模型 stop_reason 拦截技术，实现模型与物理世界（Terminal/FS）的真闭环交互。
+## 安装与启动
 
-📩 异步信箱协议 (JSONL Message Bus): 基于文件系统的 Append-only 消息总线。每个 Agent 拥有独立 Inbox，支持 send、broadcast 和 drain-on-read 机制，解决同步阻塞痛点。
+```powershell
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+# 编辑 .env，填写 ANTHROPIC_API_KEY 与 MODEL_ID
+python agent.py
+```
 
-👥 团队生命周期管理: 具备身份识别的 TeammateManager。支持 Agent 的动态入职 (spawn)、状态追踪（idle/working）与持久化配置。
+也可以配置兼容 Anthropic Messages API 的服务：
 
-🧹 上下文过载保护 (Context Compacting): 实现三层压缩策略（微观修剪、自动摘要、手动压缩），有效应对长程任务下的 Token 溢出与费用冗余。
+```dotenv
+ANTHROPIC_API_KEY=...
+ANTHROPIC_BASE_URL=https://provider.example/anthropic
+MODEL_ID=provider-model-id
+```
 
-🛡️ 安全沙箱 (Security Boundary): 内置指令黑名单（拦截 rm -rf / 等危险操作）与路径溢出检查（Path Escape Defense），确保 Agent 运行安全。
+## 项目配置
 
-🛠️ 快速开始 (Quick Start)
-1. 环境准备
-Bash
-git clone https://github.com/your-username/agent-harness
-cd agent-harness
-pip install -r requirements.txt
-cp .env.example .env  # 填入你的 ANTHROPIC_API_KEY 和 MODEL_ID
-2. 启动分布式团队
-Bash
-python agents/agent.py
-3. 示例指令 (Example Prompts)
-在终端中尝试以下操作：
+在工作区根目录使用 `.agent.yml`：
 
-派生助手: spawn_teammate(name="Coder", role="Python Expert", prompt="You help me write code.")
+```yaml
+test_commands:
+  - python -m pytest -q
+lint_commands: []
+ignore_patterns:
+  - .venv/**
+  - build/**
+approval_policy: ask_on_write  # ask_on_write | allow_write | read_only
+max_steps: 40
+max_fix_attempts: 2
+command_timeout: 120
+```
 
-指派任务: send_message(to="Coder", content="Write a snake game in python.")
+配置文件中的 lint/test 命令被视为仓库所有者提供的可信命令。模型临时生成的 Shell 命令仍经过策略判断。
 
-查看团队: 输入 /team 查看所有成员状态。
+## CLI
 
-读取汇报: 输入 /inbox 查看队友发回的执行结果。
+| 命令 | 作用 |
+|---|---|
+| `/runs` | 查看历史 Run、状态、工具次数、Token 和耗时 |
+| `/inspect <run_id>` | 查看结构化执行时间线 |
+| `/replay <run_id>` | 只读回放，不调用模型、不执行工具 |
+| `/diff` | 查看最近一次任务产生的修改 |
+| `/test` | 手动运行配置的质量门禁 |
+| `/abort` | 阻止当前 Runtime 发起新的工具调用并保留轨迹 |
+| `/exit` | 退出 |
+
+审批提示支持：`y` 仅允许本次、`a` 允许本 Run 后续普通写操作、回车或 `n` 拒绝。危险动作始终默认拒绝。
+
+## 面试演示脚本
+
+准备一个带测试的小型仓库，然后输入：
+
+```text
+实现一个带输入校验的 Todo 创建功能，并补充测试。先分析仓库结构，再修改代码，最后运行质量门禁。
+```
+
+建议依次展示：
+
+1. RepoMap 如何帮助模型定位文件。
+2. 第一次写文件时出现的审批卡片。
+3. Agent 修改和自动测试；可故意准备一个失败测试展示修复循环。
+4. 最终 Diff、验证结果和 Run ID。
+5. 使用 `/inspect <run_id>` 展示工具与 Token 指标。
+6. 使用 `/replay <run_id>` 证明轨迹可以安全复盘。
+
+## 架构
+
+```text
+CLI
+ └─ AgentRuntime
+     ├─ RepoMap / context selection
+     ├─ Model client
+     ├─ ToolRegistry ─ ToolPolicy ─ approval
+     ├─ quality gates / diff
+     ├─ EventStore (.runs/<run_id>/events.jsonl)
+     └─ TeammateManager ─ MessageBus / TaskManager
+```
+
+- `runtime` 只负责模型循环、修复循环和生命周期。
+- `tools` 负责工具执行、变更快照和质量门禁。
+- `policy` 是模型输出与物理执行之间的应用层信任边界。
+- `events` 提供 append-only 轨迹与派生指标。
+- `context` 负责低成本仓库理解。
+- `team` 与 `state` 负责协作和并发一致性。
+
+## 测试
+
+```powershell
+python -m pytest -q
+python -m compileall -q agent.py coding_agent
+```
+
+测试覆盖配置、事件损坏恢复、路径穿越、命令风险、RepoMap、并发信箱、原子任务认领、Fake Model 端到端运行、危险命令拒绝、审批拒绝、质量门禁重试和只读回放。
+
+## 运行数据
+
+以下目录是本地运行状态，默认被 Git 忽略：
+
+- `.runs/`：轨迹、RepoMap 缓存。
+- `.tasks/`：持久化任务。
+- `.team/`：团队配置与信箱。
+- `.transcripts/`：旧版本兼容数据，可手动清理。
