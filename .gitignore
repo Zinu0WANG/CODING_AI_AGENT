@@ -1,0 +1,11 @@
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+__pycache__/
+.pytest_cache/
+.runs/
+.team/
+.tasks/
+*.pyc

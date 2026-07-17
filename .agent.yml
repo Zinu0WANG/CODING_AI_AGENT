@@ -1,0 +1,8 @@
+test_commands:
+  - python -m pytest -q
+lint_commands: []
+ignore_patterns:
+  - .venv/**
+  - build/**
+approval_policy: ask_on_write
+max_steps: 40
