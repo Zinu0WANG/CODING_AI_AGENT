@@ -8,7 +8,7 @@ import yaml
 
 DEFAULT_IGNORES = [
     ".git/**", ".venv/**", "venv/**", "__pycache__/**", "node_modules/**",
-    "build/**", "dist/**", ".runs/**", ".team/**", ".tasks/**",
+    "build/**", "dist/**", ".runs/**", ".team/**", ".tasks/**", ".plans/**",
 ]
 
 

@@ -21,6 +21,7 @@ def test_config_loads_defaults_and_project_overrides(tmp_path: Path):
     assert config.test_commands == ["python -m pytest -q"]
     assert config.max_steps == 12
     assert ".git/**" in config.ignore_patterns
+    assert ".plans/**" in config.ignore_patterns
     assert config.context_keep_tool_batches == 3
     assert config.artifact_threshold_tokens == 1000
     assert config.context_window_tokens == 128000

@@ -7,14 +7,16 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
 from .config import AgentConfig
 from .events import EventStore
+from .plans import PlanStore
 from .policy import PolicyDecision, RiskLevel
-from .runtime import AgentRuntime, AnthropicModel, RunResult
+from .runtime import AgentRuntime, AnthropicModel, RunMode, RunResult
 from .state import MessageBus, TaskManager
 
 
@@ -24,6 +26,7 @@ class AgentCLI:
         self.workspace = (workspace or Path.cwd()).resolve()
         self.console = console or Console()
         self.config = AgentConfig.load(self.workspace)
+        self.plan_store = PlanStore(self.workspace, self.config.ignore_patterns, self.config.max_file_bytes)
         self.last_runtime: AgentRuntime | None = None
         self.model = self._create_model()
 
@@ -65,6 +68,89 @@ class AgentCLI:
             raise
         self.render_result(result)
         return result
+
+    def create_plan(self, request: str) -> dict | None:
+        if not request.strip():
+            self.console.print("[red]Usage: /plan REQUIREMENT[/red]")
+            return None
+        runtime = AgentRuntime(
+            self.workspace, self.config, self.model, self.approve,
+            interactive=False, enable_team=False, mode=RunMode.PLAN,
+        )
+        self.last_runtime = runtime
+        self.console.print(f"[dim]planning_run_id={runtime.events.run_id}[/dim]")
+        result = runtime.run(request)
+        if result.status != "planned" or not result.answer.strip():
+            self.console.print(Panel(result.answer or "Plan generation failed", title="PLAN FAILED", border_style="red"))
+            return None
+        selected_files = [
+            event.get("payload", {}).get("path") for event in runtime.events.read_events()
+            if event.get("type") == "context_selected" and event.get("payload", {}).get("path")
+        ]
+        try:
+            plan = self.plan_store.create(request, result.answer, result.run_id, selected_files)
+        except ValueError as exc:
+            runtime.events.emit("run_failed", "lead", {"reason": str(exc), "mode": RunMode.PLAN.value})
+            self.console.print(f"[red]Plan generation failed: {exc}[/red]")
+            return None
+        runtime.events.emit("plan_created", "lead", {
+            "plan_id": plan["plan_id"], "selected_files": plan["selected_files"],
+            "workspace_fingerprint": plan["workspace_fingerprint"], "git_head": plan["git_head"],
+        })
+        self.console.print(Panel(Markdown(plan["plan"]), title=f"PLAN {plan['plan_id']}", border_style="cyan"))
+        self.console.print(f"[dim]Execute with /implement {plan['plan_id']}[/dim]")
+        return plan
+
+    def implement_plan(self, plan_id: str) -> RunResult | None:
+        try:
+            plan = self.plan_store.begin(plan_id)
+        except ValueError as exc:
+            self.console.print(f"[red]{exc}[/red]")
+            return None
+        planning_events = EventStore(self.workspace, plan["planning_run_id"])
+        if plan["status"] == "stale":
+            planning_events.emit("plan_stale", "lead", {
+                "plan_id": plan_id, "reason": "workspace or Git HEAD changed",
+            })
+            self.console.print(f"[red]Plan {plan_id} is stale. Generate a new plan with /plan.[/red]")
+            return None
+        prompt = (
+            "Implement the approved plan below. Recheck every assumption against the current repository, "
+            "then modify files, run quality gates, and report truthfully.\n\n"
+            f"ORIGINAL REQUEST:\n{plan['original_request']}\n\nAPPROVED PLAN:\n{plan['plan']}"
+        )
+        runtime = AgentRuntime(self.workspace, self.config, self.model, self.approve, mode=RunMode.ACT)
+        self.last_runtime = runtime
+        runtime.events.emit("plan_implementation_started", "lead", {
+            "plan_id": plan_id, "planning_run_id": plan["planning_run_id"],
+        })
+        self.console.print(f"[dim]implementation_run_id={runtime.events.run_id} plan_id={plan_id}[/dim]")
+        result = runtime.run(prompt)
+        final_status = "completed" if result.status == "completed" else "failed"
+        self.plan_store.finish(plan_id, final_status, result.run_id)
+        event_type = "plan_implementation_completed" if final_status == "completed" else "plan_implementation_failed"
+        runtime.events.emit(event_type, "lead", {
+            "plan_id": plan_id, "planning_run_id": plan["planning_run_id"], "status": result.status,
+        })
+        self.render_result(result)
+        return result
+
+    def show_plans(self) -> None:
+        table = Table("Plan ID", "Status", "Request", "Planning Run", "Implementation Run")
+        for plan in self.plan_store.list_all():
+            table.add_row(
+                plan.get("plan_id", ""), plan.get("status", ""), plan.get("original_request", "")[:60],
+                plan.get("planning_run_id", "")[:8], (plan.get("implementation_run_id") or "")[:8],
+            )
+        self.console.print(table)
+
+    def show_plan(self, plan_id: str) -> None:
+        try:
+            plan = self.plan_store.load(plan_id)
+        except ValueError as exc:
+            self.console.print(f"[red]{exc}[/red]")
+            return
+        self.console.print(Panel(Markdown(plan["plan"]), title=f"PLAN {plan_id} · {plan['status']}", border_style="cyan"))
 
     def render_result(self, result: RunResult) -> None:
         color = "green" if result.status == "completed" else "red"
@@ -141,7 +227,15 @@ class AgentCLI:
         argument = parts[1] if len(parts) > 1 else ""
         if name in {"/quit", "/exit", "/q"}:
             return False
-        if name == "/runs":
+        if name == "/plan":
+            self.create_plan(argument)
+        elif name == "/plans":
+            self.show_plans()
+        elif name == "/show-plan":
+            self.show_plan(argument)
+        elif name == "/implement":
+            self.implement_plan(argument)
+        elif name == "/runs":
             self.show_runs()
         elif name == "/team":
             self.show_team()
@@ -163,7 +257,8 @@ class AgentCLI:
                 self.last_runtime.abort()
             self.console.print("[yellow]Current run marked aborted.[/yellow]")
         elif name == "/help":
-            self.console.print("/runs · /inspect ID · /replay ID · /team · /messages [STATUS] · "
+            self.console.print("/plan REQUIREMENT · /plans · /show-plan ID · /implement ID · "
+                               "/runs · /inspect ID · /replay ID · /team · /messages [STATUS] · "
                                "/retry-message ID · /diff · /test · /abort · /exit")
         else:
             self.console.print(f"[red]Unknown command: {name}[/red]")
