@@ -3,7 +3,7 @@ from pathlib import Path
 
 from coding_agent.config import AgentConfig
 from coding_agent.events import EventStore
-from coding_agent.runtime import AgentRuntime, FakeModel
+from coding_agent.runtime import AgentRuntime, FakeModel, RunMode
 from coding_agent.tools import ToolRegistry
 
 
@@ -339,3 +339,48 @@ def test_runtime_uses_configured_output_limit_and_replans_after_three_no_progres
     assert all(call["max_tokens"] == 2345 for call in model.calls)
     assert "NO PROGRESS DETECTED" in json.dumps(model.calls[-1]["messages"])
     assert any(event["type"] == "agent_no_progress" for event in runtime.events.read_events())
+
+
+class PlanningModel:
+    def __init__(self):
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "## 实施步骤\n1. 修改 app.py"}]}
+
+
+def test_plan_mode_exposes_only_read_tools_and_skips_quality_gates(tmp_path: Path):
+    model = PlanningModel()
+    config = AgentConfig(
+        approval_policy="allow_write",
+        test_commands=["python -c \"raise SystemExit(1)\""],
+    )
+    runtime = AgentRuntime(tmp_path, config, model, interactive=False, mode=RunMode.PLAN)
+    result = runtime.run("计划修改 app.py")
+
+    names = {schema["name"] for schema in model.calls[0]["tools"]}
+    assert names == {"bash", "read_file", "read_files", "repo_map", "artifact_read", "artifact_search", "task_list"}
+    assert result.status == "planned"
+    assert result.diff == ""
+    assert result.validation == ""
+    assert not any(event["type"] == "validation_finished" for event in runtime.events.read_events())
+
+
+def test_plan_mode_rejects_forged_write_tool_call(tmp_path: Path):
+    model = FakeModel([
+        {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "forged", "name": "write_file",
+          "input": {"path": "forbidden.py", "content": "bad"}}]},
+        {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Read-only plan"}]},
+    ])
+    runtime = AgentRuntime(
+        tmp_path, AgentConfig(approval_policy="allow_write"), model,
+        interactive=False, mode=RunMode.PLAN,
+    )
+    result = runtime.run("Plan only")
+
+    assert result.status == "planned"
+    assert not (tmp_path / "forbidden.py").exists()
+    denied = next(event for event in runtime.events.read_events()
+                  if event["type"] == "tool_finished" and event["payload"]["tool"] == "write_file")
+    assert "write operation denied" in denied["payload"]["output"]
