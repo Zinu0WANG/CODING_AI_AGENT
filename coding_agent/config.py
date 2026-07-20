@@ -41,6 +41,8 @@ class AgentConfig:
     team_session_recent_messages: int = 12
     team_session_summary_tokens: int = 2000
     team_require_write_scope: bool = True
+    model_max_output_tokens: int = 3000
+    no_progress_replan_after: int = 3
 
     @classmethod
     def load(cls, workspace: Path) -> "AgentConfig":
@@ -97,4 +99,8 @@ class AgentConfig:
             raise ValueError("team_session_recent_messages must be between 1 and 100")
         if not 256 <= config.team_session_summary_tokens <= 12000:
             raise ValueError("team_session_summary_tokens must be between 256 and 12000")
+        if not 256 <= config.model_max_output_tokens <= 32000:
+            raise ValueError("model_max_output_tokens must be between 256 and 32000")
+        if not 1 <= config.no_progress_replan_after <= 10:
+            raise ValueError("no_progress_replan_after must be between 1 and 10")
         return config

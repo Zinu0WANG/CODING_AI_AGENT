@@ -77,7 +77,13 @@ team_delivery_timeout_seconds: 60
 team_session_recent_messages: 12
 team_session_summary_tokens: 2000
 team_require_write_scope: true
+model_max_output_tokens: 3000
+no_progress_replan_after: 3
 ```
+
+为减少模型往返，Agent 会优先使用 `read_files` 批量读取候选文件，并使用 `batch_edit`
+在全部替换预检通过后批量修改。未发生变化的文件会返回缓存引用；连续 3 轮完全重复工具调用时，
+Runtime 会要求模型停止重复并重新规划。
 
 配置文件中的 lint/test 命令被视为仓库所有者提供的可信命令。模型临时生成的 Shell 命令仍经过策略判断。
 

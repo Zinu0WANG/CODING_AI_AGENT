@@ -256,3 +256,86 @@ def test_scoped_teammate_shell_write_requires_explicit_approval(tmp_path: Path):
     denied = registry.execute("bash", {"command": "python -c \"from pathlib import Path; Path('x').write_text('x')\""})
     assert "write scope denied" in denied
     assert len(calls) == 1
+
+
+def test_batch_read_uses_cache_and_write_invalidates_it(tmp_path: Path):
+    (tmp_path / "a.py").write_text("value = 1\nvalue = 10\n", encoding="utf-8")
+    registry = ToolRegistry(
+        tmp_path, AgentConfig(approval_policy="allow_write"), EventStore(tmp_path),
+    )
+    arguments = {"files": [{"path": "a.py", "reason": "test"}]}
+    first = registry.execute("read_files", arguments)
+    second = registry.execute("read_files", arguments)
+    assert "value = 1" in first
+    assert "unchanged; reuse the previous result" in second
+
+    full_view = registry.execute("read_files", {
+        "files": [{"path": "a.py", "reason": "need a different view", "limit": 1}],
+    })
+    assert "value = 1" in full_view
+    assert "1 more lines" in full_view
+    assert "unchanged" not in full_view
+
+    registry.execute("write_file", {"path": "a.py", "content": "value = 2\n"})
+    third = registry.execute("read_files", arguments)
+    assert "value = 2" in third
+    assert "unchanged" not in third
+
+
+def test_batch_edit_is_atomic_when_any_replacement_is_invalid(tmp_path: Path):
+    (tmp_path / "a.py").write_text("a = 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("b = 1\n", encoding="utf-8")
+    registry = ToolRegistry(
+        tmp_path, AgentConfig(approval_policy="allow_write"), EventStore(tmp_path),
+    )
+    output = registry.execute("batch_edit", {"edits": [
+        {"path": "a.py", "old_text": "a = 1", "new_text": "a = 2"},
+        {"path": "b.py", "old_text": "missing", "new_text": "b = 2"},
+    ]})
+    assert output.startswith("Error:")
+    assert "found 0" in output
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "a = 1\n"
+    assert (tmp_path / "b.py").read_text(encoding="utf-8") == "b = 1\n"
+
+
+def test_batch_edit_applies_multiple_replacements_after_validation(tmp_path: Path):
+    (tmp_path / "a.py").write_text("a = 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("b = 1\n", encoding="utf-8")
+    registry = ToolRegistry(
+        tmp_path, AgentConfig(approval_policy="allow_write"), EventStore(tmp_path),
+    )
+    output = registry.execute("batch_edit", {"edits": [
+        {"path": "a.py", "old_text": "a = 1", "new_text": "a = 2"},
+        {"path": "b.py", "old_text": "b = 1", "new_text": "b = 2"},
+    ]})
+    assert output.startswith("Applied 2 edits")
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "a = 2\n"
+    assert (tmp_path / "b.py").read_text(encoding="utf-8") == "b = 2\n"
+
+
+class RepeatingToolModel:
+    def __init__(self):
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) <= 4:
+            return {"stop_reason": "tool_use", "content": [{
+                "type": "tool_use", "id": f"repeat-{len(self.calls)}", "name": "repo_map", "input": {},
+            }]}
+        return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "replanned"}]}
+
+
+def test_runtime_uses_configured_output_limit_and_replans_after_three_no_progress_rounds(tmp_path: Path):
+    model = RepeatingToolModel()
+    config = AgentConfig(
+        approval_policy="allow_write", model_max_output_tokens=2345,
+        no_progress_replan_after=3,
+    )
+    runtime = AgentRuntime(tmp_path, config, model, interactive=False)
+    result = runtime.run("Inspect the repository")
+
+    assert result.status == "completed"
+    assert all(call["max_tokens"] == 2345 for call in model.calls)
+    assert "NO PROGRESS DETECTED" in json.dumps(model.calls[-1]["messages"])
+    assert any(event["type"] == "agent_no_progress" for event in runtime.events.read_events())

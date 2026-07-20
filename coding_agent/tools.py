@@ -39,6 +39,7 @@ class ToolRegistry:
         self._before: dict[Path, bytes | None] = self._snapshot_workspace()
         self._background: dict[str, dict] = {}
         self._background_lock = threading.Lock()
+        self._read_cache: dict[Path, tuple[tuple[int, int], str, set[int | None]]] = {}
         self.aborted = False
 
     def _snapshot_workspace(self) -> dict[Path, bytes | None]:
@@ -56,8 +57,18 @@ class ToolRegistry:
         return [
             self._schema("bash", "Run a shell command under the application approval policy.", {"command": {"type": "string"}}, ["command"]),
             self._schema("read_file", "Read a workspace file and record why it was selected.", {"path": {"type": "string"}, "reason": {"type": "string"}, "limit": {"type": "integer"}}, ["path", "reason"]),
+            self._schema("read_files", "Read multiple independent workspace files in one tool round.", {
+                "files": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {
+                    "path": {"type": "string"}, "reason": {"type": "string"}, "limit": {"type": "integer"},
+                }, "required": ["path", "reason"]}},
+            }, ["files"]),
             self._schema("write_file", "Write a workspace file.", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
             self._schema("edit_file", "Replace one exact occurrence in a workspace file.", {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, ["path", "old_text", "new_text"]),
+            self._schema("batch_edit", "Atomically apply multiple exact replacements after validating every edit.", {
+                "edits": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {
+                    "path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"},
+                }, "required": ["path", "old_text", "new_text"]}},
+            }, ["edits"]),
             self._schema("repo_map", "Refresh and show the repository map.", {}, []),
             self._schema("background_run", "Run an approved command in a background thread.", {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"]),
             self._schema("check_background", "Check one or all background commands.", {"task_id": {"type": "string"}}, []),
@@ -86,8 +97,18 @@ class ToolRegistry:
             return self.policy.classify_command(arguments["command"])
         if name in {"write_file", "edit_file"}:
             return self.policy.classify_path(arguments["path"], write=True)
+        if name == "batch_edit":
+            decisions = [self.policy.classify_path(edit.get("path", ""), write=True)
+                         for edit in arguments.get("edits", [])]
+            dangerous = next((item for item in decisions if item.risk is RiskLevel.DANGEROUS), None)
+            return dangerous or PolicyDecision(RiskLevel.WRITE, "modifies multiple workspace files")
         if name == "read_file":
             return self.policy.classify_path(arguments["path"], write=False)
+        if name == "read_files":
+            decisions = [self.policy.classify_path(item.get("path", ""), write=False)
+                         for item in arguments.get("files", [])]
+            dangerous = next((item for item in decisions if item.risk is RiskLevel.DANGEROUS), None)
+            return dangerous or PolicyDecision(RiskLevel.READ, "reads multiple workspace files")
         if name in {"task_create", "task_update"}:
             return PolicyDecision(RiskLevel.WRITE, "updates workspace task state")
         return PolicyDecision(RiskLevel.READ, "read-only agent operation")
@@ -145,15 +166,19 @@ class ToolRegistry:
     def _scope_error(self, name: str, arguments: dict, decision: PolicyDecision) -> str | None:
         if self.allowed_write_scope is None or decision.risk is not RiskLevel.WRITE:
             return None
-        if name in {"write_file", "edit_file"}:
-            relative = self.policy.resolve_path(arguments["path"]).relative_to(self.workspace).as_posix()
-            for pattern in self.allowed_write_scope:
-                normalized = pattern.replace("\\", "/").lstrip("./")
-                if fnmatch.fnmatchcase(relative, normalized) or (
-                    normalized.endswith("/**") and relative.startswith(normalized[:-3].rstrip("/") + "/")
-                ):
-                    return None
-            return f"{relative} is outside {self.allowed_write_scope}"
+        if name in {"write_file", "edit_file", "batch_edit"}:
+            paths = [arguments["path"]] if name != "batch_edit" else [edit.get("path", "") for edit in arguments.get("edits", [])]
+            for raw_path in paths:
+                relative = self.policy.resolve_path(raw_path).relative_to(self.workspace).as_posix()
+                allowed = any(
+                    fnmatch.fnmatchcase(relative, pattern.replace("\\", "/").lstrip("./")) or (
+                        pattern.replace("\\", "/").lstrip("./").endswith("/**") and
+                        relative.startswith(pattern.replace("\\", "/").lstrip("./")[:-3].rstrip("/") + "/")
+                    ) for pattern in self.allowed_write_scope
+                )
+                if not allowed:
+                    return f"{relative} is outside {self.allowed_write_scope}"
+            return None
         if name in {"bash", "background_run"}:
             # Shell side effects cannot be mapped reliably to paths. Require an explicit human approval.
             decision = PolicyDecision(decision.risk, "shell write target cannot be proven to stay inside teammate write_scope")
@@ -175,21 +200,23 @@ class ToolRegistry:
             result = subprocess.run(arguments["command"], shell=True, cwd=self.workspace, capture_output=True,
                                     text=True, timeout=self.config.command_timeout)
             output = (result.stdout + result.stderr).strip() or "(no output)"
+            self._read_cache.clear()
             return f"exit_code={result.returncode}\n{output}"
         if name == "read_file":
-            path = self.policy.resolve_path(arguments["path"])
-            text = path.read_text(encoding="utf-8")
-            lines = text.splitlines()
-            limit = arguments.get("limit")
-            if limit and len(lines) > limit:
-                text = "\n".join(lines[:limit] + [f"... ({len(lines) - limit} more lines)"])
-            self.events.emit("context_selected", self.actor, {"path": arguments["path"], "reason": arguments["reason"]})
-            return text
+            return self._read_one(arguments)
+        if name == "read_files":
+            if not arguments.get("files"):
+                return "Error: files must not be empty"
+            return "\n\n".join(
+                f"===== {item.get('path', '')} =====\n{self._read_one(item)}"
+                for item in arguments["files"]
+            )
         if name == "write_file":
             path = self.policy.resolve_path(arguments["path"])
             self._remember(path)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(arguments["content"], encoding="utf-8")
+            self._read_cache.pop(path, None)
             return f"Wrote {len(arguments['content'])} characters to {arguments['path']}"
         if name == "edit_file":
             path = self.policy.resolve_path(arguments["path"])
@@ -198,7 +225,10 @@ class ToolRegistry:
             if content.count(arguments["old_text"]) != 1:
                 return f"Error: old_text must occur exactly once; found {content.count(arguments['old_text'])}"
             path.write_text(content.replace(arguments["old_text"], arguments["new_text"], 1), encoding="utf-8")
+            self._read_cache.pop(path, None)
             return f"Edited {arguments['path']}"
+        if name == "batch_edit":
+            return self._batch_edit(arguments.get("edits", []))
         if name == "repo_map":
             return self.repo_map.render()
         if name == "artifact_read":
@@ -244,6 +274,50 @@ class ToolRegistry:
                 matches = [p for p in (self.workspace / "skills").glob("**/SKILL.md") if p.parent.name == skill_name]
             return matches[0].read_text(encoding="utf-8") if matches else f"Error: unknown skill {skill_name}"
         return f"Error: unknown tool {name}"
+
+    def _read_one(self, arguments: dict) -> str:
+        path = self.policy.resolve_path(arguments["path"])
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+        cached = self._read_cache.get(path)
+        limit = arguments.get("limit")
+        same_view = bool(cached and cached[0] == signature and limit in cached[2])
+        self.events.emit("context_selected", self.actor, {
+            "path": arguments["path"], "reason": arguments["reason"], "cached": same_view,
+        })
+        if same_view:
+            return f"File unchanged; reuse the previous result for {arguments['path']}."
+        if cached and cached[0] == signature:
+            text, views = cached[1], cached[2]
+            views.add(limit)
+        else:
+            text, views = path.read_text(encoding="utf-8"), {limit}
+        self._read_cache[path] = (signature, text, views)
+        lines = text.splitlines()
+        if limit and len(lines) > limit:
+            return "\n".join(lines[:limit] + [f"... ({len(lines) - limit} more lines)"])
+        return text
+
+    def _batch_edit(self, edits: list[dict]) -> str:
+        if not edits:
+            return "Error: edits must not be empty"
+        staged: dict[Path, str] = {}
+        display_paths: dict[Path, str] = {}
+        for edit in edits:
+            path = self.policy.resolve_path(edit["path"])
+            content = staged.get(path)
+            if content is None:
+                content = path.read_text(encoding="utf-8")
+            count = content.count(edit["old_text"])
+            if count != 1:
+                return f"Error: {edit['path']}: old_text must occur exactly once; found {count}"
+            staged[path] = content.replace(edit["old_text"], edit["new_text"], 1)
+            display_paths[path] = edit["path"]
+        for path, content in staged.items():
+            self._remember(path)
+            path.write_text(content, encoding="utf-8")
+            self._read_cache.pop(path, None)
+        return f"Applied {len(edits)} edits across {len(staged)} files: " + ", ".join(display_paths.values())
 
     def _background_exec(self, task_id: str, command: str, timeout: int) -> None:
         try:

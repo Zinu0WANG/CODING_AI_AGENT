@@ -25,3 +25,5 @@ team_delivery_timeout_seconds: 60
 team_session_recent_messages: 12
 team_session_summary_tokens: 2000
 team_require_write_scope: false
+model_max_output_tokens: 3000
+no_progress_replan_after: 3

@@ -40,6 +40,8 @@ def test_config_loads_defaults_and_project_overrides(tmp_path: Path):
     assert config.team_session_recent_messages == 12
     assert config.team_session_summary_tokens == 2000
     assert config.team_require_write_scope is True
+    assert config.model_max_output_tokens == 3000
+    assert config.no_progress_replan_after == 3
 
 
 def test_config_rejects_compaction_target_at_or_above_trigger(tmp_path: Path):
